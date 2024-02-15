@@ -1277,6 +1277,8 @@ class UNetCFG1d(UNet1d):
         negative_embedding_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tensor:
+        # Print out the embedding
+        print("Embedding:", embedding)
         b, device = embedding.shape[0], embedding.device
 
         if self.use_xattn_time:
