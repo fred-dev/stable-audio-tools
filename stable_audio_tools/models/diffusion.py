@@ -543,6 +543,8 @@ def create_diffusion_uncond_from_config(config: tp.Dict[str, tp.Any]):
     model_type = diffusion_uncond_config.get('type', None)
 
     diffusion_config = diffusion_uncond_config.get('config', {})
+    
+    print("diffusion_config:: Unconditional error",diffusion_config)  
 
     assert model_type is not None, "Must specify model type in config"
 
