@@ -237,6 +237,7 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
             negative_embedding=negative_cross_attn_cond,
             negative_embedding_mask=negative_cross_attn_mask,
             **kwargs)
+        print("global_cond::UNetCFG1DWrapper",global_cond)
 
         p.tick("UNetCFG1D forward")
 
