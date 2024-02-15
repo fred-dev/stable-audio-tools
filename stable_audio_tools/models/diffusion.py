@@ -214,6 +214,8 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
                 prepend_cond=None,
                 prepend_cond_mask=None,
                 **kwargs):
+        
+        print("cross_attn_cond:", cross_attn_cond)
         p = Profiler()
 
         p.tick("start")
