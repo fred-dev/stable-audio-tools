@@ -202,6 +202,7 @@ class SampleDataset(torch.utils.data.Dataset):
             if self.custom_metadata_fn is not None:
                 custom_metadata = self.custom_metadata_fn(info, audio)
                 info.update(custom_metadata)
+                print("Custom metadata:", info)
 
                 if "__reject__" in info and info["__reject__"]:
                     return self[random.randrange(len(self))]
