@@ -1413,6 +1413,9 @@ class UNetAll1d(UNetCFG1d, UNetNCCA1d):
 
 
 def XUNet1d(type: str = "base", **kwargs) -> UNet1d:
+    print("Initializing UNetCFG1d with the following configuration:")
+    for key, value in kwargs.items():
+        print(f"{key}: {value}")
     if type == "base":
         return UNet1d(**kwargs)
     elif type == "all":
