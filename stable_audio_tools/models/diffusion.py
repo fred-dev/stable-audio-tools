@@ -167,6 +167,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 "negative_input_concat_cond": input_concat_cond
             }
         else:
+            print("global_cond:", global_cond)
             return {
                 "cross_attn_cond": cross_attention_input,
                 "cross_attn_mask": cross_attention_masks,
