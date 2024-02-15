@@ -10,6 +10,7 @@ def create_model_from_config(model_config):
         return create_autoencoder_from_config(model_config)
     elif model_type == 'diffusion_uncond':
         from .diffusion import create_diffusion_uncond_from_config
+        print("model_config :: factory", model_config)
         return create_diffusion_uncond_from_config(model_config)
     elif model_type == 'diffusion_cond' or model_type == 'diffusion_cond_inpaint' or model_type == "diffusion_prior":
         from .diffusion import create_diffusion_cond_from_config
