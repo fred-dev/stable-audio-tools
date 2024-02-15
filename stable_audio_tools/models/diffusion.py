@@ -147,6 +147,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             global_cond = torch.cat([cond[key][0] for key in self.global_cond_ids], dim=-1)
             if len(global_cond.shape) == 3:
                 global_cond = global_cond.squeeze(1)
+            print("get_conditioning_inputs::global_cond", global_cond)
 
         if len(self.input_concat_ids) > 0:
             # Concatenate all input concat conditioning inputs over the channel dimension
@@ -167,7 +168,6 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 "negative_input_concat_cond": input_concat_cond
             }
         else:
-            print("global_cond:", global_cond)
             return {
                 "cross_attn_cond": cross_attention_input,
                 "cross_attn_mask": cross_attention_masks,
@@ -215,8 +215,6 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
                 prepend_cond=None,
                 prepend_cond_mask=None,
                 **kwargs):
-        
-        print("cross_attn_cond:", cross_attn_cond)
         p = Profiler()
 
         p.tick("start")
