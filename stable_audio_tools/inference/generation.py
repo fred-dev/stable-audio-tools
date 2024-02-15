@@ -100,6 +100,8 @@ def generate_diffusion_cond(
         return_latents = False,
         **sampler_kwargs
         ) -> torch.Tensor: 
+    
+    print("get_conditioning_inputs gneration: " , conditioning)
     """
     Generate audio from a prompt using a diffusion model.
     
