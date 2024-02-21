@@ -183,6 +183,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             }
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: tp.Dict[str, tp.Any], **kwargs):
+        print("diffusion.py::ConditionedDiffusionModelWrapper::forward::cond", cond)
         return self.model(x, t, **self.get_conditioning_inputs(cond), **kwargs)
 
     def generate(self, *args, **kwargs):
@@ -243,7 +244,7 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
             negative_embedding=negative_cross_attn_cond,
             negative_embedding_mask=negative_cross_attn_mask,
             **kwargs)
-        print("global_cond::UNetCFG1DWrapper",global_cond)
+        print("diffusion.py::global_cond::UNetCFG1DWrapper",global_cond)
 
         p.tick("UNetCFG1D forward")
 
