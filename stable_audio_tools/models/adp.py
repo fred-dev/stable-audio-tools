@@ -27,7 +27,7 @@ class ConditionedSequential(nn.Module):
     def __init__(self, *modules):
         super().__init__()
         self.module_list = nn.ModuleList(*modules)
-        print("ADP: ConditionedSequential: __init__")
+        print("adp.py: ConditionedSequential: __init__")
 
     def forward(self, x: Tensor, mapping: Optional[Tensor] = None):
         for module in self.module_list:
@@ -72,7 +72,7 @@ Convolutional Blocks
 class Conv1d(nn.Conv1d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("ADP: Conv1d: __init__")
+        print("adp.py: Conv1d: __init__")
     
     def forward(self, x: Tensor, causal=False) -> Tensor:
         kernel_size = self.kernel_size[0]
@@ -89,13 +89,13 @@ class Conv1d(nn.Conv1d):
             padding_right = padding_total // 2
             padding_left = padding_total - padding_right
             x = pad1d(x, (padding_left, padding_right + extra_padding))
-        print("ADP: Conv1d: forward")
+        print("adp.py: Conv1d: forward")
         return super().forward(x)
         
 class ConvTranspose1d(nn.ConvTranspose1d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("ADP: ConvTranspose1d: __init__")
+        print("adp.py: ConvTranspose1d: __init__")
 
     def forward(self, x: Tensor, causal=False) -> Tensor:
         kernel_size = self.kernel_size[0]
@@ -117,7 +117,7 @@ class ConvTranspose1d(nn.ConvTranspose1d):
             padding_right = padding_total // 2
             padding_left = padding_total - padding_right
             y = unpad1d(y, (padding_left, padding_right))
-        print("ADP: ConvTranspose1d: forward")
+        print("adp.py: ConvTranspose1d: forward")
         return y
     
 
@@ -125,7 +125,7 @@ def Downsample1d(
     in_channels: int, out_channels: int, factor: int, kernel_multiplier: int = 2
 ) -> nn.Module:
     assert kernel_multiplier % 2 == 0, "Kernel multiplier must be even"
-    print("ADP: Downsample1d: __init__")
+    print("adp.py: Downsample1d: __init__")
     return Conv1d(
         in_channels=in_channels,
         out_channels=out_channels,
@@ -137,7 +137,7 @@ def Downsample1d(
 def Upsample1d(
     in_channels: int, out_channels: int, factor: int, use_nearest: bool = False
 ) -> nn.Module:
-    print("ADP: Upsample1d: __init__")
+    print("adp.py: Upsample1d: __init__")
     if factor == 1:
         return Conv1d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=3
@@ -174,7 +174,7 @@ class ConvBlock1d(nn.Module):
         use_norm: bool = True,
         use_snake: bool = False
     ) -> None:
-        print("ADP: ConvBlock1d: __init__")
+        print("adp.py: ConvBlock1d: __init__")
         super().__init__()
 
         self.groupnorm = (
@@ -204,7 +204,7 @@ class ConvBlock1d(nn.Module):
             scale, shift = scale_shift
             x = x * (scale + 1) + shift
         x = self.activation(x)
-        print("ADP: ConvBlock1d: forward")
+        print("adp.py: ConvBlock1d: forward")
         return self.project(x, causal=causal)
 
 
@@ -214,7 +214,7 @@ class MappingToScaleShift(nn.Module):
         features: int,
         channels: int,
     ):
-        print("ADP: MappingToScaleShift: __init__")
+        print("adp.py: MappingToScaleShift: __init__")
         super().__init__()
 
         self.to_scale_shift = nn.Sequential(
@@ -226,7 +226,7 @@ class MappingToScaleShift(nn.Module):
         scale_shift = self.to_scale_shift(mapping)
         scale_shift = rearrange(scale_shift, "b c -> b c 1")
         scale, shift = scale_shift.chunk(2, dim=1)
-        print("ADP: MappingToScaleShift: forward")
+        print("adp.py: MappingToScaleShift: forward")
         return scale, shift
 
 
@@ -244,7 +244,7 @@ class ResnetBlock1d(nn.Module):
         num_groups: int = 8,
         context_mapping_features: Optional[int] = None,
     ) -> None:
-        print("ADP: ResnetBlock1d: __init__")
+        print("adp.py: ResnetBlock1d: __init__")
         super().__init__()
 
         self.use_mapping = exists(context_mapping_features)
@@ -291,7 +291,7 @@ class ResnetBlock1d(nn.Module):
             scale_shift = self.to_scale_shift(mapping)
 
         h = self.block2(h, scale_shift=scale_shift, causal=causal)
-        print("ADP: ResnetBlock1d: forward")
+        print("adp.py: ResnetBlock1d: forward")
         return h + self.to_out(x)
 
 
@@ -304,7 +304,7 @@ class Patcher(nn.Module):
         context_mapping_features: Optional[int] = None,
         use_snake: bool = False,
     ):
-        print("ADP: Patcher: __init__")
+        print("adp.py: Patcher: __init__")
         super().__init__()
         assert_message = f"out_channels must be divisible by patch_size ({patch_size})"
         assert out_channels % patch_size == 0, assert_message
@@ -321,7 +321,7 @@ class Patcher(nn.Module):
     def forward(self, x: Tensor, mapping: Optional[Tensor] = None, causal=False) -> Tensor:
         x = self.block(x, mapping, causal=causal)
         x = rearrange(x, "b c (l p) -> b (c p) l", p=self.patch_size)
-        print("ADP: Patcher: forward")
+        print("adp.py: Patcher: forward")
         return x
 
 
@@ -334,7 +334,7 @@ class Unpatcher(nn.Module):
         context_mapping_features: Optional[int] = None,
         use_snake: bool = False
     ):  
-        print("ADP: Unpatcher: __init__")   
+        print("adp.py: Unpatcher: __init__")   
         super().__init__()
         assert_message = f"in_channels must be divisible by patch_size ({patch_size})"
         assert in_channels % patch_size == 0, assert_message
@@ -351,7 +351,7 @@ class Unpatcher(nn.Module):
     def forward(self, x: Tensor, mapping: Optional[Tensor] = None, causal=False) -> Tensor:
         x = rearrange(x, " b (c p) l -> b c (l p) ", p=self.patch_size)
         x = self.block(x, mapping, causal=causal)
-        print("ADP: Unpatcher: forward")
+        print("adp.py: Unpatcher: forward")
         return x
 
 
@@ -360,7 +360,7 @@ Attention Components
 """
 def FeedForward(features: int, multiplier: int) -> nn.Module:
     mid_features = features * multiplier
-    print("ADP: FeedForward: __init__")
+    print("adp.py: FeedForward: __init__")
     return nn.Sequential(
         nn.Linear(in_features=features, out_features=mid_features),
         nn.GELU(),
@@ -375,14 +375,14 @@ def add_mask(sim: Tensor, mask: Tensor) -> Tensor:
         mask = repeat(mask, "n m -> b 1 n m", b=b)
     max_neg_value = -torch.finfo(sim.dtype).max
     sim = sim.masked_fill(~mask, max_neg_value)
-    print("ADP: add_mask")
+    print("adp.py: add_mask")
     return sim
 
 def causal_mask(q: Tensor, k: Tensor) -> Tensor:
     b, i, j, device = q.shape[0], q.shape[-2], k.shape[-2], q.device
     mask = ~torch.ones((i, j), dtype=torch.bool, device=device).triu(j - i + 1)
     mask = repeat(mask, "n m -> b n m", b=b)
-    print("ADP: causal_mask")
+    print("adp.py: causal_mask")
     return mask
 
 class AttentionBase(nn.Module):
@@ -394,7 +394,7 @@ class AttentionBase(nn.Module):
         num_heads: int,
         out_features: Optional[int] = None,
     ):  
-        print("ADP: AttentionBase: __init__")
+        print("adp.py: AttentionBase: __init__")
         super().__init__()
         self.scale = head_features**-0.5
         self.num_heads = num_heads
@@ -444,7 +444,7 @@ class AttentionBase(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=is_causal)
 
         out = rearrange(out, "b h n d -> b n (h d)")
-        print("ADP: AttentionBase: forward")
+        print("adp.py: AttentionBase: forward")
         return self.to_out(out)
 
 class Attention(nn.Module):
@@ -458,7 +458,7 @@ class Attention(nn.Module):
         context_features: Optional[int] = None,
         causal: bool = False,
     ):
-        print("ADP: Attention: __init__")
+        print("adp.py: Attention: __init__")
         super().__init__()
         self.context_features = context_features
         self.causal = causal
@@ -500,14 +500,14 @@ class Attention(nn.Module):
             # Mask out cross-attention for padding tokens
             mask = repeat(context_mask, "b m -> b m d", d=v.shape[-1])
             k, v = k * mask, v * mask
-        print("ADP: Attention: forward")
+        print("adp.py: Attention: forward")
         # Compute and return attention
         return self.attention(q, k, v, is_causal=self.causal or causal)
 
 
 def FeedForward(features: int, multiplier: int) -> nn.Module:
     mid_features = features * multiplier
-    print("ADP: FeedForward: __init__")
+    print("adp.py: FeedForward: __init__")
     return nn.Sequential(
         nn.Linear(in_features=features, out_features=mid_features),
         nn.GELU(),
@@ -528,7 +528,7 @@ class TransformerBlock(nn.Module):
         multiplier: int,
         context_features: Optional[int] = None,
     ):
-        print("ADP: TransformerBlock: __init__")
+        print("adp.py: TransformerBlock: __init__")
         super().__init__()
 
         self.use_cross_attention = exists(context_features) and context_features > 0
@@ -554,7 +554,7 @@ class TransformerBlock(nn.Module):
         if self.use_cross_attention:
             x = self.cross_attention(x, context=context, context_mask=context_mask) + x
         x = self.feed_forward(x) + x
-        print("ADP: TransformerBlock: forward")
+        print("adp.py: TransformerBlock: forward")
         return x
 
 
@@ -573,7 +573,7 @@ class Transformer1d(nn.Module):
         multiplier: int,
         context_features: Optional[int] = None,
     ):
-        print("ADP: Transformer1d: __init__")
+        print("adp.py: Transformer1d: __init__")
         super().__init__()
 
         self.to_in = nn.Sequential(
@@ -613,7 +613,7 @@ class Transformer1d(nn.Module):
         for block in self.blocks:
             x = block(x, context=context, context_mask=context_mask, causal=causal)
         x = self.to_out(x)
-        print("ADP: Transformer1d: forward")
+        print("adp.py: Transformer1d: forward")
         return x
 
 
@@ -626,14 +626,14 @@ class SinusoidalEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        print("ADP: SinusoidalEmbedding: __init__")
+        print("adp.py: SinusoidalEmbedding: __init__")
 
     def forward(self, x: Tensor) -> Tensor:
         device, half_dim = x.device, self.dim // 2
         emb = torch.tensor(log(10000) / (half_dim - 1), device=device)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = rearrange(x, "i -> i 1") * rearrange(emb, "j -> 1 j")
-        print("ADP: SinusoidalEmbedding: forward")
+        print("adp.py: SinusoidalEmbedding: forward")
         return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
@@ -645,19 +645,19 @@ class LearnedPositionalEmbedding(nn.Module):
         assert (dim % 2) == 0
         half_dim = dim // 2
         self.weights = nn.Parameter(torch.randn(half_dim))
-        print("ADP: LearnedPositionalEmbedding: __init__")
+        print("adp.py: LearnedPositionalEmbedding: __init__")
 
     def forward(self, x: Tensor) -> Tensor:
         x = rearrange(x, "b -> b 1")
         freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim=-1)
-        print("ADP: LearnedPositionalEmbedding: forward")
+        print("adp.py: LearnedPositionalEmbedding: forward")
         return fouriered
 
 
 def TimePositionalEmbedding(dim: int, out_features: int) -> nn.Module:
-    print("ADP: TimePositionalEmbedding: __init__")
+    print("adp.py: TimePositionalEmbedding: __init__")
     return nn.Sequential(
         LearnedPositionalEmbedding(dim),
         nn.Linear(in_features=dim + 1, out_features=out_features),
@@ -691,7 +691,7 @@ class DownsampleBlock1d(nn.Module):
         context_mapping_features: Optional[int] = None,
         context_embedding_features: Optional[int] = None,
     ):
-        print("ADP: DownsampleBlock1d: __init__")
+        print("adp.py: DownsampleBlock1d: __init__")
         super().__init__()
         self.use_pre_downsample = use_pre_downsample
         self.use_skip = use_skip
@@ -783,7 +783,7 @@ class DownsampleBlock1d(nn.Module):
         if self.use_extract:
             extracted = self.to_extracted(x)
             return x, extracted
-        print("ADP: DownsampleBlock1d: forward")
+        print("adp.py: DownsampleBlock1d: forward")
         return (x, skips) if self.use_skip else x
 
 
@@ -810,7 +810,7 @@ class UpsampleBlock1d(nn.Module):
         context_mapping_features: Optional[int] = None,
         context_embedding_features: Optional[int] = None,
     ):
-        print("ADP: UpsampleBlock1d: __init__")
+        print("adp.py: UpsampleBlock1d: __init__")
         super().__init__()
 
         self.use_extract = extract_channels > 0
@@ -872,7 +872,7 @@ class UpsampleBlock1d(nn.Module):
             )
 
     def add_skip(self, x: Tensor, skip: Tensor) -> Tensor:
-        print("ADP: UpsampleBlock1d: add_skip")
+        print("adp.py: UpsampleBlock1d: add_skip")
         return torch.cat([x, skip * self.skip_scale], dim=1)
 
     def forward(
@@ -902,7 +902,7 @@ class UpsampleBlock1d(nn.Module):
         if self.use_extract:
             extracted = self.to_extracted(x)
             return x, extracted
-        print("ADP: UpsampleBlock1d: forward")
+        print("adp.py: UpsampleBlock1d: forward")
         return x
 
 
@@ -920,7 +920,7 @@ class BottleneckBlock1d(nn.Module):
         context_embedding_features: Optional[int] = None,
         use_snake: bool = False,
     ):
-        print("ADP: BottleneckBlock1d: __init__")
+        print("adp.py: BottleneckBlock1d: __init__")
         super().__init__()
         self.use_transformer = num_transformer_blocks > 0
 
@@ -974,7 +974,7 @@ class BottleneckBlock1d(nn.Module):
         if self.use_transformer:
             x = self.transformer(x, context=embedding, context_mask=embedding_mask, causal=causal)
         x = self.post_block(x, mapping=mapping, causal=causal)
-        print("ADP: BottleneckBlock1d: forward")
+        print("adp.py: BottleneckBlock1d: forward")
         return x
 
 
@@ -1008,7 +1008,7 @@ class UNet1d(nn.Module):
         context_embedding_features: Optional[int] = None,
         **kwargs,
     ):
-        print("ADP: UNet1d: __init__")
+        print("adp.py: UNet1d: __init__")
         super().__init__()
         out_channels = default(out_channels, in_channels)
         context_channels = list(default(context_channels, []))
@@ -1174,7 +1174,7 @@ class UNet1d(nn.Module):
         assert channels.shape[1] == num_channels, message
         # STFT channels if requested
         channels = self.stft.encode1d(channels) if self.use_stft_context else channels  # type: ignore # noqa
-        print("ADP: UNet1d: get_channels")
+        print("adp.py: UNet1d: get_channels")
         return channels
 
     def get_mapping(
@@ -1196,7 +1196,7 @@ class UNet1d(nn.Module):
         if self.use_context_time or self.use_context_features:
             mapping = reduce(torch.stack(items), "n b m -> b m", "sum")
             mapping = self.to_mapping(mapping)
-            print("ADP: UNet1d: get_mapping")
+            print("adp.py: UNet1d: get_mapping")
         return mapping
 
     def forward(
@@ -1236,7 +1236,7 @@ class UNet1d(nn.Module):
         x += skips_list.pop()
         x = self.to_out(x, mapping, causal=causal)
         x = self.stft.decode1d(x) if self.use_stft else x
-        print("ADP: UNet1d: forward")
+        print("adp.py: UNet1d: forward")
         return x
 
 
@@ -1248,7 +1248,7 @@ class FixedEmbedding(nn.Module):
         super().__init__()
         self.max_length = max_length
         self.embedding = nn.Embedding(max_length, features)
-        print("ADP: FixedEmbedding: __init__")
+        print("adp.py: FixedEmbedding: __init__")
 
     def forward(self, x: Tensor) -> Tensor:
         batch_size, length, device = *x.shape[0:2], x.device
@@ -1257,12 +1257,12 @@ class FixedEmbedding(nn.Module):
         position = torch.arange(length, device=device)
         fixed_embedding = self.embedding(position)
         fixed_embedding = repeat(fixed_embedding, "n d -> b n d", b=batch_size)
-        print("ADP: FixedEmbedding: forward")
+        print("adp.py: FixedEmbedding: forward")
         return fixed_embedding
 
 
 def rand_bool(shape: Any, proba: float, device: Any = None) -> Tensor:
-    print("ADP: rand_bool")
+    print("adp.py: rand_bool")
     if proba == 1:
         return torch.ones(shape, device=device, dtype=torch.bool)
     elif proba == 0:
@@ -1282,7 +1282,11 @@ class UNetCFG1d(UNet1d):
         use_xattn_time: bool = False,
         **kwargs,
     ):
-        print("ADP: UNetCFG1d: __init__")
+        print("adp.py: UNetCFG1d: __init__")
+        #prunt out all kwargs
+        for key, value in kwargs.items():
+            print("adp.py: UNetCFG1d: __init__: kwargs" , key, ":", value)
+            
         super().__init__(
             context_embedding_features=context_embedding_features, **kwargs
         )
@@ -1321,7 +1325,7 @@ class UNetCFG1d(UNet1d):
         **kwargs,
     ) -> Tensor:
         # Print out the embedding
-        print("Embedding:", embedding)
+        print("adp.py: UNetCFG1d: Forwards: embedding", embedding)
         b, device = embedding.shape[0], embedding.device
 
         if self.use_xattn_time:
@@ -1340,9 +1344,9 @@ class UNetCFG1d(UNet1d):
             embedding = torch.where(batch_mask, fixed_embedding, embedding)
 
         if embedding_scale != 1.0:
-            print("ADP: UNetCFG1d: forward:; ebmbedding_scale != 1.0")
+            print("adp.py: UNetCFG1d: forward:; ebmbedding_scale != 1.0")
             if batch_cfg:
-                print("ADP: UNetCFG1d: forward:; ebmbedding_scale != 1.0: batch_cfg=True")
+                print("adp.py: UNetCFG1d: forward:; ebmbedding_scale != 1.0: batch_cfg=True")
 
                 batch_x = torch.cat([x, x], dim=0)
                 batch_time = torch.cat([time, time], dim=0)
@@ -1379,7 +1383,7 @@ class UNetCFG1d(UNet1d):
                 out, out_masked = batch_out.chunk(2, dim=0)
            
             else:
-                print("ADP: UNetCFG1d: forward:; ebmbedding_scale != 1.0: batch_cfg=False")
+                print("adp.py: UNetCFG1d: forward:; ebmbedding_scale != 1.0: batch_cfg=False")
                 # Compute both normal and fixed embedding outputs
                 out = super().forward(x, time, embedding=embedding, embedding_mask=embedding_mask, **kwargs)
                 out_masked = super().forward(x, time, embedding=fixed_embedding, embedding_mask=embedding_mask, **kwargs)
@@ -1387,7 +1391,7 @@ class UNetCFG1d(UNet1d):
             out_cfg = out_masked + (out - out_masked) * embedding_scale
 
             if rescale_cfg:
-                print("ADP: UNetCFG1d: forward:; rescale_cfg=True")
+                print("adp.py: UNetCFG1d: forward:; rescale_cfg=True")
 
                 out_std = out.std(dim=1, keepdim=True)
                 out_cfg_std = out_cfg.std(dim=1, keepdim=True)
@@ -1395,11 +1399,11 @@ class UNetCFG1d(UNet1d):
                 return scale_phi * (out_cfg * (out_std/out_cfg_std)) + (1-scale_phi) * out_cfg
 
             else:
-                print("ADP: UNetCFG1d: forward:; rescale_cfg=False")
+                print("adp.py: UNetCFG1d: forward:; rescale_cfg=False")
                 return out_cfg
                 
         else:
-            print("ADP: UNetCFG1d: forward:; ebmbedding_scale == 1.0:: before return")
+            print("adp.py: UNetCFG1d: forward:; ebmbedding_scale == 1.0:: before return")
             return super().forward(x, time, embedding=embedding, embedding_mask=embedding_mask, **kwargs)
 
 
@@ -1410,11 +1414,11 @@ class UNetNCCA1d(UNet1d):
     def __init__(self, context_features: int, **kwargs):
         super().__init__(context_features=context_features, **kwargs)
         self.embedder = NumberEmbedder(features=context_features)
-        print("ADP: UNetNCCA1d: __init__")  
+        print("adp.py: UNetNCCA1d: __init__")  
 
     def expand(self, x: Any, shape: Tuple[int, ...]) -> Tensor:
         x = x if torch.is_tensor(x) else torch.tensor(x)
-        print("ADP: UNetNCCA1d: expand")
+        print("adp.py: UNetNCCA1d: expand")
         return x.expand(shape)
 
     def forward(  # type: ignore
@@ -1446,7 +1450,7 @@ class UNetNCCA1d(UNet1d):
         # Scale embedding (sum reduction if more than one channel list item)
         channels_scale_emb = self.embedder(channels_scale)
         channels_scale_emb = reduce(channels_scale_emb, "b n d -> b d", "sum")
-        print("ADP: UNetNCCA1d: forward")
+        print("adp.py: UNetNCCA1d: forward")
         return super().forward(
             x=x,
             time=time,
@@ -1459,10 +1463,10 @@ class UNetNCCA1d(UNet1d):
 class UNetAll1d(UNetCFG1d, UNetNCCA1d):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print("ADP: UNetAll1d: __init__")
+        print("adp.py: UNetAll1d: __init__")
 
     def forward(self, *args, **kwargs):  # type: ignore
-        print("ADP: UNetAll1d: forward")
+        print("adp.py: UNetAll1d: forward")
         return UNetCFG1d.forward(self, *args, **kwargs)
 
 
@@ -1487,7 +1491,7 @@ class NumberEmbedder(nn.Module):
         features: int,
         dim: int = 256,
     ):
-        print("ADP: NumberEmbedder: __init__")
+        print("adp.py: NumberEmbedder: __init__")
         super().__init__()
         self.features = features
         self.embedding = TimePositionalEmbedding(dim=dim, out_features=features)
@@ -1501,7 +1505,7 @@ class NumberEmbedder(nn.Module):
         x = rearrange(x, "... -> (...)")
         embedding = self.embedding(x)
         x = embedding.view(*shape, self.features)
-        print("ADP: NumberEmbedder: forward")
+        print("adp.py: NumberEmbedder: forward")
         return x  # type: ignore
 
 
@@ -1521,7 +1525,7 @@ class STFT(nn.Module):
         length: Optional[int] = None,
         use_complex: bool = False,
     ):
-        print("ADP: STFT: __init__")
+        print("adp.py: STFT: __init__")
         super().__init__()
         self.num_fft = num_fft
         self.hop_length = default(hop_length, floor(num_fft // 4))
@@ -1551,7 +1555,7 @@ class STFT(nn.Module):
             # Returns magnitude and phase matrices
             magnitude, phase = torch.abs(stft), torch.angle(stft)
             stft_a, stft_b = magnitude, phase
-        print("ADP: STFT: encode")
+        print("adp.py: STFT: encode")
 
         return rearrange_many((stft_a, stft_b), "(b c) f l -> b c f l", b=b)
 
@@ -1578,7 +1582,7 @@ class STFT(nn.Module):
             length=default(self.length, length),
             normalized=True,
         )
-        print("ADP: STFT: decode")
+        print("adp.py: STFT: decode")
         return rearrange(wave, "(b c) t -> b c t", b=b)
 
     def encode1d(
@@ -1586,12 +1590,12 @@ class STFT(nn.Module):
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         stft_a, stft_b = self.encode(wave)
         stft_a, stft_b = rearrange_many((stft_a, stft_b), "b c f l -> b (c f) l")
-        print("ADP: STFT: encode1d")
+        print("adp.py: STFT: encode1d")
         return torch.cat((stft_a, stft_b), dim=1) if stacked else (stft_a, stft_b)
 
     def decode1d(self, stft_pair: Tensor) -> Tensor:
         f = self.num_fft // 2 + 1
         stft_a, stft_b = stft_pair.chunk(chunks=2, dim=1)
         stft_a, stft_b = rearrange_many((stft_a, stft_b), "b (c f) l -> b c f l", f=f)
-        print("ADP: STFT: decode1d")
+        print("adp.py: STFT: decode1d")
         return self.decode(stft_a, stft_b)
