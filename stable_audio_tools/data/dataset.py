@@ -202,13 +202,16 @@ class SampleDataset(torch.utils.data.Dataset):
             end_time = time.time()
 
             info["load_time"] = end_time - start_time
-
+            
             if self.custom_metadata_fn is not None:
-                custom_metadata_fn_de_dilled = dill.loads(self.custom_metadata_fn)
-
-                print("Dataset.py:SampleDataset: Getting the actula metadate function:: ",custom_metadata_fn_de_dilled)
-                custom_metadata = custom_metadata_fn_de_dilled(info, audio)
+                custom_metadata = self.custom_metadata_fn(info, audio)
                 info.update(custom_metadata)
+                
+            if self.custom_metadata_fn is not None:
+                custom_metadata_fn_deserialised = dill.loads(self.custom_metadata_fn)
+                custom_metadata = custom_metadata_fn_deserialised(info, audio)
+                info.update(custom_metadata)
+                
                 print("Custom metadata:", info)
 
                 if "__reject__" in info and info["__reject__"]:
