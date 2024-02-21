@@ -1327,13 +1327,13 @@ class UNetCFG1d(UNet1d):
         # Print out the embedding
         print("adp.py: UNetCFG1d: Forwards: embedding", embedding)
         
-        print("adp.py: UNetCFG1d: Forwards: fixed_embedding", fixed_embedding)
+        #print("adp.py: UNetCFG1d: Forwards: fixed_embedding", fixed_embedding)
 
         fixed_embedding = self.fixed_embedding(embedding)
-        
-        b, device = embedding.shape[0], embedding.device
-        
         print("adp.py: UNetCFG1d: Forwards: fixed_embedding after", fixed_embedding)
+
+        b, device = 4, embedding.device
+        
 
         if self.use_xattn_time:
             embedding = torch.cat([embedding, self.to_time_embedding(time).unsqueeze(1)], dim=1)
