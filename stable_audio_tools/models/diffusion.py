@@ -128,6 +128,7 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         self.min_input_length = min_input_length
 
     def get_conditioning_inputs(self, cond: tp.Dict[str, tp.Any], negative=False):
+        print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::cond", cond)
         cross_attention_input = None
         cross_attention_masks = None
         global_cond = None
@@ -136,31 +137,35 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         prepend_cond_mask = None
 
         if len(self.cross_attn_cond_ids) > 0:
+            print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::cross_attn_cond_ids", self.cross_attn_cond_ids)
             # Concatenate all cross-attention inputs over the sequence dimension
             # Assumes that the cross-attention inputs are of shape (batch, seq, channels)
             cross_attention_input = torch.cat([cond[key][0] for key in self.cross_attn_cond_ids], dim=1)
             cross_attention_masks = torch.cat([cond[key][1] for key in self.cross_attn_cond_ids], dim=1)
 
         if len(self.global_cond_ids) > 0:
+            print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::global_cond_ids", self.global_cond_ids)
             # Concatenate all global conditioning inputs over the channel dimension
             # Assumes that the global conditioning inputs are of shape (batch, channels)
             global_cond = torch.cat([cond[key][0] for key in self.global_cond_ids], dim=-1)
             if len(global_cond.shape) == 3:
                 global_cond = global_cond.squeeze(1)
-            print("get_conditioning_inputs::global_cond", global_cond)
-
+            print("get_conditioning_inputs::global_cond", global_cond.shape)
         if len(self.input_concat_ids) > 0:
+            print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::input_concat_ids", self.input_concat_ids)
             # Concatenate all input concat conditioning inputs over the channel dimension
             # Assumes that the input concat conditioning inputs are of shape (batch, channels, seq)
             input_concat_cond = torch.cat([cond[key][0] for key in self.input_concat_ids], dim=1)
 
         if len(self.prepend_cond_ids) > 0:
+            print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::prepend_cond_ids", self.prepend_cond_ids)
             # Concatenate all prepend conditioning inputs over the sequence dimension
             # Assumes that the prepend conditioning inputs are of shape (batch, seq, channels)
             prepend_cond = torch.cat([cond[key][0] for key in self.prepend_cond_ids], dim=1)
             prepend_cond_mask = torch.cat([cond[key][1] for key in self.prepend_cond_ids], dim=1)
 
         if negative:
+            print("diffusion.py::ConditionedDiffusionModelWrapper::get_conditioning_inputs::negative", negative)
             return {
                 "negative_cross_attn_cond": cross_attention_input,
                 "negative_cross_attn_mask": cross_attention_masks,
