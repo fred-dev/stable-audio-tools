@@ -51,6 +51,7 @@ def fast_scandir(
         sf, f = fast_scandir(dir, ext)
         subfolders.extend(sf)
         files.extend(f)
+    print("dataset.py: fast_scandir")
     return subfolders, files
 
 def keyword_scandir(
@@ -106,6 +107,7 @@ def get_audio_filenames(
         else:
             subfolders, files = fast_scandir(path, exts)
         filenames.extend(files)
+    print("dataset.py: get_audio_filenames")
     return filenames
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -120,6 +122,7 @@ class SampleDataset(torch.utils.data.Dataset):
         force_channels="stereo",
         custom_metadata_fn: Optional[Callable[[str], str]] = None
     ):
+        print("dataset.py: SampleDataset: init")
         super().__init__()
         self.filenames = []
         self.relpath = relpath
@@ -159,7 +162,7 @@ class SampleDataset(torch.utils.data.Dataset):
         if in_sr != self.sr:
             resample_tf = T.Resample(in_sr, self.sr)
             audio = resample_tf(audio)
-
+        print("dataset.py: SampleDataset: load_file")
         return audio
 
     def __len__(self):
@@ -206,7 +209,7 @@ class SampleDataset(torch.utils.data.Dataset):
 
                 if "__reject__" in info and info["__reject__"]:
                     return self[random.randrange(len(self))]
-
+            print("dataset.py: SampleDataset: __getitem__")
             return (audio, info)
         except Exception as e:
             print(f'Couldn\'t load file {audio_filename}: {e}')
@@ -242,7 +245,7 @@ def group_by_keys(data, keys=wds.tariterators.base_plus_ext, lcase=True, suffixe
             current_sample[suffix] = value
     if wds.tariterators.valid_sample(current_sample):
         yield current_sample
-
+    print("dataset.py: group_by_keys")
 wds.tariterators.group_by_keys = group_by_keys
 
 # S3 code and WDS preprocessing code based on implementation by Scott Hawley originally in https://github.com/zqevans/audio-diffusion/blob/main/dataset/dataset.py
@@ -287,6 +290,7 @@ def get_s3_contents(dataset_path, s3_url_prefix=None, filter='', recursive=True,
     if debug:
         print("contents = \n", contents)
     # Return the list of S3 paths to files
+    print("dataset.py: get_s3_contents")
     return contents
 
 
@@ -337,12 +341,14 @@ def get_all_s3_urls(
                     print("request_str = ", request_str)
                 # Add the constructed URL to the list of URLs
                 urls.append(request_str)
+    print("dataset.py: get_all_s3_urls")
     return urls
 
 
 def log_and_continue(exn):
     """Call in an exception handler to ignore any exception, isssue a warning, and continue."""
     print(f"Handling webdataset error ({repr(exn)}). Ignoring.")
+    print("dataset.py: log_and_continue")
     return True
 
 
@@ -351,7 +357,7 @@ def is_valid_sample(sample):
     has_audio = "audio" in sample
     is_silent = is_silence(sample["audio"])
     is_rejected = "__reject__" in sample["json"] and sample["json"]["__reject__"]
-
+    print("dataset.py: is_valid_sample")
     return has_json and has_audio and not is_silent and not is_rejected
 
 class S3DatasetConfig:
@@ -362,6 +368,7 @@ class S3DatasetConfig:
         custom_metadata_fn: Optional[Callable[[str], str]] = None,
         profile: Optional[str] = None,
     ):
+        print("dataset.py: S3DatasetConfig: init")
         self.id = id
         self.s3_path = s3_path
         self.custom_metadata_fn = custom_metadata_fn
@@ -375,7 +382,7 @@ class S3DatasetConfig:
             recursive=True,
             profiles={self.s3_path: self.profile} if self.profile else {},
         )
-
+        print("dataset.py: S3DatasetConfig: load_data_urls")
         return self.urls
 
 def audio_decoder(key, value):
@@ -416,6 +423,7 @@ class S3WebDataLoader():
         augment_phase=True,
         **data_loader_kwargs
     ):
+        print("dataset.py: S3WebDataLoader: init")
 
         self.datasets = datasets
 
@@ -507,12 +515,13 @@ class S3WebDataLoader():
 
         # Add audio to the metadata as well for conditioning
         sample["json"]["audio"] = audio
-        
+        print("dataset.py: S3WebDataLoader: wds_preprocess")
         return sample
 
 def create_dataloader_from_configs_and_args(model_config, args, dataset_config):
 
     dataset_type = dataset_config.get("dataset_type", None)
+    print("dataset.py: create_dataloader_from_configs_and_args" + dataset_type)
 
     assert dataset_type is not None, "Dataset type must be specified in dataset config"
 
