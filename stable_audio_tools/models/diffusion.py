@@ -193,7 +193,8 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
         self,
         *args,
         **kwargs
-    ):
+    ):  
+        print("diffusion.py::UNetCFG1DWrapper::__init")
         super().__init__(supports_cross_attention=True, supports_global_cond=True, supports_input_concat=True)
 
         self.model = UNetCFG1d(*args, **kwargs)
