@@ -10,6 +10,7 @@ import time
 import torch
 import torchaudio
 import webdataset as wds
+import dill
 
 from aeiou.core import is_silence
 from os import path
@@ -146,7 +147,7 @@ class SampleDataset(torch.utils.data.Dataset):
 
         self.sr = sample_rate
 
-        self.custom_metadata_fn = custom_metadata_fn
+        self.custom_metadata_fn = dill.dumps(custom_metadata_fn)
 
     def load_file(self, filename):
         ext = filename.split(".")[-1]
@@ -203,7 +204,10 @@ class SampleDataset(torch.utils.data.Dataset):
             info["load_time"] = end_time - start_time
 
             if self.custom_metadata_fn is not None:
-                custom_metadata = self.custom_metadata_fn(info, audio)
+                custom_metadata_fn_de_dilled = dill.loads(self.custom_metadata_fn)
+
+                print("Dataset.py:SampleDataset: Getting the actula metadate function:: ",custom_metadata_fn_de_dilled)
+                custom_metadata = custom_metadata_fn_de_dilled(info, audio)
                 info.update(custom_metadata)
                 print("Custom metadata:", info)
 
