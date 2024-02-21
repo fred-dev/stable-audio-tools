@@ -224,7 +224,7 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
         p = Profiler()
 
         p.tick("start")
-        print("diffusion.py::UNetCFG1DWrapper::forward::x")
+        print("diffusion.py::UNetCFG1DWrapper::forward::feautures",global_cond)
         channels_list = None
         if input_concat_cond is not None:
             channels_list = [input_concat_cond]
