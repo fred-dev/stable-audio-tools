@@ -594,6 +594,7 @@ def create_diffusion_uncond_from_config(config: tp.Dict[str, tp.Any]):
                                 min_input_length=min_input_length)
 
 def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
+    print("diffusion.py::create_diffusion_cond_from_config::config", config)
 
     model_config = config["model"]
 
