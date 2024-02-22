@@ -203,9 +203,9 @@ class SampleDataset(torch.utils.data.Dataset):
 
             info["load_time"] = end_time - start_time
             
-            if self.custom_metadata_fn is not None:
-                custom_metadata = self.custom_metadata_fn(info, audio)
-                info.update(custom_metadata)
+            # if self.custom_metadata_fn is not None:
+            #     custom_metadata = self.custom_metadata_fn(info, audio)
+            #     info.update(custom_metadata)
                 
             if self.custom_metadata_fn is not None:
                 custom_metadata_fn_deserialised = dill.loads(self.custom_metadata_fn)

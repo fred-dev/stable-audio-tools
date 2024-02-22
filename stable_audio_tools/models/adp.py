@@ -199,6 +199,8 @@ class ConvBlock1d(nn.Module):
     def forward(
         self, x: Tensor, scale_shift: Optional[Tuple[Tensor, Tensor]] = None, causal=False
     ) -> Tensor:
+        print(f" adp.py: ConvBlock1d: Input shape of X: {x.shape}")  # Add this line
+
         x = self.groupnorm(x)
         if exists(scale_shift):
             scale, shift = scale_shift
