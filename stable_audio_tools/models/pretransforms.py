@@ -136,7 +136,7 @@ class PretrainedDACPretransform(Pretransform):
         
         import dac
         
-        model_path = dac.utils.download(model_type=model_type, model_bitrate=model_bitrate)
+        model_path = "/g/data/qq08/synth_orn/dac_pretrained/weights_44khz_16kbps.pth"
         
         self.model = dac.DAC.load(model_path)
 
