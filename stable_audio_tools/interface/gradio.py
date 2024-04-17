@@ -19,8 +19,8 @@ from ..inference.utils import prepare_audio
 from ..training.utils import copy_state_dict
 
 model = None
-sample_rate = 44100
-sample_size = 524288
+sample_rate = 32000
+sample_size = 1920000
 
 def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, device="cuda", model_half=False):
     global model, sample_rate, sample_size
@@ -60,14 +60,6 @@ def generate_cond(
         negative_prompt=None,
         seconds_start=0,
         seconds_total=30,
-        latitude = 0.0,
-        longitude = 0.0,
-        temperature = 0.0,
-        humidity = 0.0,
-        wind_speed = 0.0,
-        pressure = 0.0,
-        minutes_of_day = 0.0,
-        day_of_year = 0.0,
         cfg_scale=6.0,
         steps=250,
         preview_every=None,
@@ -102,10 +94,10 @@ def generate_cond(
         preview_every = None
 
     # Return fake stereo audio
-    conditioning = [{"prompt": prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year }] * batch_size
+    conditioning = [{"prompt": prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}] * batch_size
 
     if negative_prompt:
-        negative_conditioning = [{"prompt": negative_prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year }] * batch_size
+        negative_conditioning = [{"prompt": negative_prompt, "seconds_start": seconds_start, "seconds_total": seconds_total}] * batch_size
     else:
         negative_conditioning = None
         
@@ -382,22 +374,6 @@ def create_uncond_sampling_ui(model_config):
             audio_spectrogram_output
         ], 
         api_name="generate")
-def create_conditioning_slider(min_val, max_val, label):
-    """
-    Create a Gradio slider for a given conditioning parameter.
-
-    Args:
-    - min_val: The minimum value for the slider.
-    - max_val: The maximum value for the slider.
-    - label: The label for the slider, which is displayed in the UI.
-
-    Returns:
-    - A gr.Slider object configured according to the provided parameters.
-    """
-    step = (max_val - min_val) / 1000
-    default_val = (max_val + min_val) / 2
-    print(f"Creating slider for {label} with min_val={min_val}, max_val={max_val}, step={step}, default_val={default_val}")
-    return gr.Slider(minimum=min_val, maximum=max_val, step=step, value=default_val, label=label)
 
 def create_sampling_ui(model_config, inpainting=False):
     with gr.Row():
@@ -420,15 +396,9 @@ def create_sampling_ui(model_config, inpainting=False):
 
     with gr.Row(equal_height=False):
         with gr.Column():
-            with gr.Row():
-                
-                    #conditioning = [{"prompt": prompt, "latitude": -23.3402, "longitude": 150.5774, "temperature": 25.0, "humidity": 66, "wind_speed": 1.5, "pressure": 1011, "minutes_of_day": 370,"day_of_year": 60 }] * batch_size
-
-                
-                    
-                
+            with gr.Row(visible = has_seconds_start or has_seconds_total):
+                # Timing controls
                 seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Seconds start", visible=has_seconds_start)
-           
                 seconds_total_slider = gr.Slider(minimum=0, maximum=512, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
             
             with gr.Row():
@@ -439,64 +409,7 @@ def create_sampling_ui(model_config, inpainting=False):
                 preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Preview Every")
 
                 # CFG scale 
-                cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=0.2, label="CFG scale")
-                
-            with gr.Accordion("Climate and location", open=True):
-                latitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "latitude"), None)
-                if latitude_config:
-                    latitude_slider = create_conditioning_slider(
-                        min_val=latitude_config["config"]["min_val"],
-                        max_val=latitude_config["config"]["max_val"],
-                        label="latitude")
-                    
-                longitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "longitude"), None)
-                if longitude_config:
-                    longitude_slider = create_conditioning_slider(
-                        min_val=longitude_config["config"]["min_val"],
-                        max_val=longitude_config["config"]["max_val"],
-                        label="longitude")
-                    
-                temperature_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "temperature"), None)
-                if temperature_config:
-                    temperature_slider = create_conditioning_slider(
-                        min_val=temperature_config["config"]["min_val"],
-                        max_val=temperature_config["config"]["max_val"],
-                        label="temperature")
-                    
-                humidity_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "humidity"), None)
-                if humidity_config:
-                    humidity_slider = create_conditioning_slider(
-                        min_val=humidity_config["config"]["min_val"],
-                        max_val=humidity_config["config"]["max_val"],
-                        label="humidity")
-                    
-                wind_speed_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "wind_speed"), None)
-                if wind_speed_config:
-                    wind_speed_slider = create_conditioning_slider(
-                        min_val=wind_speed_config["config"]["min_val"],
-                        max_val=wind_speed_config["config"]["max_val"],
-                        label="wind_speed")
-                    
-                pressure_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "pressure"), None)
-                if pressure_config:
-                    pressure_slider = create_conditioning_slider(
-                        min_val=pressure_config["config"]["min_val"],
-                        max_val=pressure_config["config"]["max_val"],
-                        label="pressure")
-                    
-                minutes_of_day_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "minutes_of_day"), None)
-                if minutes_of_day_config:
-                    minutes_of_day_slider = create_conditioning_slider(
-                        min_val=minutes_of_day_config["config"]["min_val"],
-                        max_val=minutes_of_day_config["config"]["max_val"],
-                        label="minutes_of_day")
-                    
-                day_of_year_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "day_of_year"), None)
-                if day_of_year_config:
-                    day_of_year_slider = create_conditioning_slider(
-                        min_val=day_of_year_config["config"]["min_val"],
-                        max_val=day_of_year_config["config"]["max_val"],
-                        label="Day of year")
+                cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=7.0, label="CFG scale")
 
             with gr.Accordion("Sampler params", open=False):
             
@@ -532,15 +445,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     inputs = [prompt, 
                         negative_prompt,
                         seconds_start_slider, 
-                        seconds_total_slider,
-                        latitude_slider,
-                        longitude_slider,
-                        temperature_slider,
-                        humidity_slider,
-                        wind_speed_slider,
-                        pressure_slider,
-                        minutes_of_day_slider,
-                        day_of_year_slider, 
+                        seconds_total_slider, 
                         cfg_scale_slider, 
                         steps_slider, 
                         preview_every_slider, 
@@ -572,14 +477,6 @@ def create_sampling_ui(model_config, inpainting=False):
                         negative_prompt,
                         seconds_start_slider, 
                         seconds_total_slider, 
-                        latitude_slider,
-                        longitude_slider,
-                        temperature_slider,
-                        humidity_slider,
-                        wind_speed_slider,
-                        pressure_slider,
-                        minutes_of_day_slider,
-                        day_of_year_slider,
                         cfg_scale_slider, 
                         steps_slider, 
                         preview_every_slider, 
