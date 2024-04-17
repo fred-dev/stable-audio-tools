@@ -342,7 +342,7 @@ def create_uncond_sampling_ui(model_config):
         with gr.Column():            
             with gr.Row():
                 # Steps slider
-                steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=200, label="Steps")
+                steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=100, label="Steps")
 
             with gr.Accordion("Sampler params", open=False):
             
@@ -382,8 +382,7 @@ def create_uncond_sampling_ui(model_config):
             audio_spectrogram_output
         ], 
         api_name="generate")
-    
-def create_conditioning_slider_float(min_val, max_val, label):
+def create_conditioning_slider(min_val, max_val, label):
     """
     Create a Gradio slider for a given conditioning parameter.
 
@@ -397,23 +396,6 @@ def create_conditioning_slider_float(min_val, max_val, label):
     """
     step = (max_val - min_val) / 1000
     default_val = (max_val + min_val) / 2
-    print(f"Creating slider for {label} with min_val={min_val}, max_val={max_val}, step={step}, default_val={default_val}")
-    return gr.Slider(minimum=min_val, maximum=max_val, step=step, value=default_val, label=label)
-
-def create_conditioning_slider_int(min_val, max_val, label):
-    """
-    Create a Gradio slider for a given conditioning parameter.
-
-    Args:
-    - min_val: The minimum value for the slider.
-    - max_val: The maximum value for the slider.
-    - label: The label for the slider, which is displayed in the UI.
-
-    Returns:
-    - A gr.Slider object configured according to the provided parameters.
-    """
-    step = 1
-    default_val = int((max_val + min_val) / 2)
     print(f"Creating slider for {label} with min_val={min_val}, max_val={max_val}, step={step}, default_val={default_val}")
     return gr.Slider(minimum=min_val, maximum=max_val, step=step, value=default_val, label=label)
 
@@ -462,56 +444,56 @@ def create_sampling_ui(model_config, inpainting=False):
             with gr.Accordion("Climate and location", open=True):
                 latitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "latitude"), None)
                 if latitude_config:
-                    latitude_slider = create_conditioning_slider_float(
+                    latitude_slider = create_conditioning_slider(
                         min_val=latitude_config["config"]["min_val"],
                         max_val=latitude_config["config"]["max_val"],
                         label="latitude")
                     
                 longitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "longitude"), None)
                 if longitude_config:
-                    longitude_slider = create_conditioning_slider_float(
+                    longitude_slider = create_conditioning_slider(
                         min_val=longitude_config["config"]["min_val"],
                         max_val=longitude_config["config"]["max_val"],
                         label="longitude")
                     
                 temperature_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "temperature"), None)
                 if temperature_config:
-                    temperature_slider = create_conditioning_slider_float(
+                    temperature_slider = create_conditioning_slider(
                         min_val=temperature_config["config"]["min_val"],
                         max_val=temperature_config["config"]["max_val"],
                         label="temperature")
                     
                 humidity_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "humidity"), None)
                 if humidity_config:
-                    humidity_slider = create_conditioning_slider_float(
+                    humidity_slider = create_conditioning_slider(
                         min_val=humidity_config["config"]["min_val"],
                         max_val=humidity_config["config"]["max_val"],
                         label="humidity")
                     
                 wind_speed_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "wind_speed"), None)
                 if wind_speed_config:
-                    wind_speed_slider = create_conditioning_slider_float(
+                    wind_speed_slider = create_conditioning_slider(
                         min_val=wind_speed_config["config"]["min_val"],
                         max_val=wind_speed_config["config"]["max_val"],
                         label="wind_speed")
                     
                 pressure_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "pressure"), None)
                 if pressure_config:
-                    pressure_slider = create_conditioning_slider_float(
+                    pressure_slider = create_conditioning_slider(
                         min_val=pressure_config["config"]["min_val"],
                         max_val=pressure_config["config"]["max_val"],
                         label="pressure")
                     
                 minutes_of_day_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "minutes_of_day"), None)
                 if minutes_of_day_config:
-                    minutes_of_day_slider = create_conditioning_slider_int(
+                    minutes_of_day_slider = create_conditioning_slider(
                         min_val=minutes_of_day_config["config"]["min_val"],
                         max_val=minutes_of_day_config["config"]["max_val"],
                         label="minutes_of_day")
                     
                 day_of_year_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "day_of_year"), None)
                 if day_of_year_config:
-                    day_of_year_slider = create_conditioning_slider_int(
+                    day_of_year_slider = create_conditioning_slider(
                         min_val=day_of_year_config["config"]["min_val"],
                         max_val=day_of_year_config["config"]["max_val"],
                         label="Day of year")
