@@ -4,6 +4,7 @@ import os
 import torch
 import pytorch_lightning as pl
 import random
+import horovod.torch as hvd
 
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models import create_model_from_config
@@ -105,11 +106,14 @@ def main():
             strategy = args.strategy
     else:
         strategy = 'ddp_find_unused_parameters_true' if args.num_gpus > 1 else "auto" 
-
+        
+    hvd.init()
+    print(f"Hello from process {hvd.rank()} out of {hvd.size()} processes.")
+    
     trainer = pl.Trainer(
+        accelerator='horovod',
         devices=args.num_gpus,
-        accelerator="gpu",
-        num_nodes = args.num_nodes,
+        num_nodes = args.num_nodes, 
         strategy=strategy,
         precision=args.precision,
         accumulate_grad_batches=args.accum_batches, 
