@@ -102,10 +102,10 @@ def generate_cond(
         preview_every = None
 
     # Return fake stereo audio
-    conditioning = [{"prompt": prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year }] * batch_size
+    conditioning = [{"prompt": prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total }] * batch_size
 
     if negative_prompt:
-        negative_conditioning = [{"prompt": negative_prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year }] * batch_size
+        negative_conditioning = [{"prompt": negative_prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total}] * batch_size
     else:
         negative_conditioning = None
         
@@ -421,11 +421,6 @@ def create_sampling_ui(model_config, inpainting=False):
     with gr.Row(equal_height=False):
         with gr.Column():
             with gr.Row():
-                
-                    #conditioning = [{"prompt": prompt, "latitude": -23.3402, "longitude": 150.5774, "temperature": 25.0, "humidity": 66, "wind_speed": 1.5, "pressure": 1011, "minutes_of_day": 370,"day_of_year": 60 }] * batch_size
-
-                
-                    
                 
                 seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Seconds start", visible=has_seconds_start)
            
