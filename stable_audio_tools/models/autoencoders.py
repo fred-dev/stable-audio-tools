@@ -59,9 +59,10 @@ class ResidualUnit(nn.Module):
     def forward(self, x):
         res = x
         
-        x = checkpoint(self.layers, x)
+        # Disable checkpoint until tensor mismatch is fixed
+        #x = checkpoint(self.layers, x)
+        x = self.layers(x)
 
-        return x + res
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride, use_snake=False, antialias_activation=False):
