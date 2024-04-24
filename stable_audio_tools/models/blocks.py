@@ -50,7 +50,7 @@ class SelfAttention1d(nn.Module):
 
         if device_properties.major == 8 and device_properties.minor == 0:
             # Use flash attention for A100 GPUs
-            self.sdp_kernel_config = (True, False, False)
+            self.sdp_kernel_config = (False, True, True)
         else:
             # Don't use flash attention for other GPUs
             self.sdp_kernel_config = (False, True, True)
