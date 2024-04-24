@@ -41,7 +41,7 @@ class SelfAttention1d(nn.Module):
         self.out_proj = nn.Conv1d(c_in, c_in, 1)
         self.dropout = nn.Dropout(dropout_rate, inplace=True)
 
-        self.use_flash = False
+        self.use_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
 
         if not self.use_flash:
             return
