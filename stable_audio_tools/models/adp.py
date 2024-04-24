@@ -442,7 +442,7 @@ class AttentionBase(nn.Module):
             in_features=mid_features, out_features=out_features
         )
 
-        self.use_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
+        self.use_flash = False
 
         if not self.use_flash:
             return
