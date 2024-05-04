@@ -305,9 +305,9 @@ class Attention(nn.Module):
         if natten_kernel_size is not None:
             return
 
-        self.use_pt_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
+        self.use_pt_flash = False
 
-        self.use_fa_flash = torch.cuda.is_available() and flash_attn_func is not None
+        self.use_fa_flash = False
 
         self.sdp_kwargs = dict(
             enable_flash = True,

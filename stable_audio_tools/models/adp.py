@@ -442,7 +442,7 @@ class AttentionBase(nn.Module):
             in_features=mid_features, out_features=out_features
         )
 
-        self.use_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
+        self.use_flash = False
 
         if not self.use_flash:
             return
@@ -451,7 +451,7 @@ class AttentionBase(nn.Module):
 
         if device_properties.major == 8 and device_properties.minor == 0:
             # Use flash attention for A100 GPUs
-            self.sdp_kernel_config = (True, False, False)
+            self.sdp_kernel_config = (False, True, True)
         else:
             # Don't use flash attention for other GPUs
             self.sdp_kernel_config = (False, True, True)

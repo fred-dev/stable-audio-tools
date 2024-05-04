@@ -41,7 +41,7 @@ class SelfAttention1d(nn.Module):
         self.out_proj = nn.Conv1d(c_in, c_in, 1)
         self.dropout = nn.Dropout(dropout_rate, inplace=True)
 
-        self.use_flash = torch.cuda.is_available() and version.parse(torch.__version__) >= version.parse('2.0.0')
+        self.use_flash = False
 
         if not self.use_flash:
             return
@@ -50,7 +50,7 @@ class SelfAttention1d(nn.Module):
 
         if device_properties.major == 8 and device_properties.minor == 0:
             # Use flash attention for A100 GPUs
-            self.sdp_kernel_config = (True, False, False)
+            self.sdp_kernel_config = (False, True, True)
         else:
             # Don't use flash attention for other GPUs
             self.sdp_kernel_config = (False, True, True)
@@ -301,11 +301,10 @@ class RMSNorm(nn.Module):
 def snake_beta(x, alpha, beta):
     return x + (1.0 / (beta + 0.000000001)) * pow(torch.sin(x * alpha), 2)
 
-# Disable snake_beta compliation until error is fixed
-# try:
-#     snake_beta = torch.compile(snake_beta)
-# except RuntimeError:
-#     pass
+try:
+    snake_beta = torch.compile(snake_beta)
+except RuntimeError:
+    pass
 
 # Adapted from https://github.com/NVIDIA/BigVGAN/blob/main/activations.py under MIT license
 # License available in LICENSES/LICENSE_NVIDIA.txt
