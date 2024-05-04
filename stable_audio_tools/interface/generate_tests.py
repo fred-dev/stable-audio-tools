@@ -1,9 +1,10 @@
 import gc
 import numpy as np
-import gradio as gr
 import json 
 import torch
 import torchaudio
+import sys
+import os
 
 from aeiou.viz import audio_spectrogram_image
 from einops import rearrange
@@ -17,7 +18,6 @@ from ..models.pretrained import get_pretrained_model
 from ..models.utils import load_ckpt_state_dict
 from ..inference.utils import prepare_audio
 from ..training.utils import copy_state_dict
-import sys
 
 
 model = None
@@ -302,7 +302,8 @@ def load_and_generate(model_path, json_dir, output_dir):
     for json_file in glob(os.path.join(json_dir, '*.json')):
         with open(json_file, 'r') as file:
             data = json.load(file)
-        
+        #print the json path
+        print(json_file)
         # Extract conditions from JSON
         conditions = {
             'birdSpecies': data['birdSpecies'],
