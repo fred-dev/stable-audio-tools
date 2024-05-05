@@ -3,8 +3,8 @@ import numpy as np
 import json 
 import torch
 import torchaudio
-import sys
 import os
+import re
 
 from aeiou.viz import audio_spectrogram_image
 from einops import rearrange
@@ -57,7 +57,7 @@ def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pr
 
     return model, model_config
 
-def generate_cond(
+def generate_cond_with_path(
         prompt,
         negative_prompt=None,
         seconds_start=0,
@@ -298,12 +298,30 @@ def autoencoder_process(audio, latent_noise, n_quantizers):
     return "output.wav"
 
 def load_and_generate(model_path, json_dir, output_dir):
-    """ Load JSON files and generate audio for each set of conditions """
-    for json_file in glob(os.path.join(json_dir, '*.json')):
-        with open(json_file, 'r') as file:
-            data = json.load(file)
-        #print the json path
-        print(json_file)
+    """Load JSON files and generate audio for each set of conditions."""
+    # List all files in the json_dir
+    files = os.listdir(json_dir)
+    
+    # Filter for JSON files
+    json_files = [file for file in files if file.endswith('.json')]
+    
+    if not json_files:
+        print(f"No JSON files found in {json_dir}. Please check the directory path and file permissions.")
+        return
+
+    for json_filename in json_files:
+        json_file_path = os.path.join(json_dir, json_filename)
+        
+        try:
+            with open(json_file_path, 'r') as file:
+                data = json.load(file)
+        except Exception as e:
+            print(f"Failed to read or parse {json_file_path}: {e}")
+            continue
+        
+        # Print the JSON path
+        print(json_file_path)
+        
         # Extract conditions from JSON
         conditions = {
             'birdSpecies': data['birdSpecies'],
@@ -318,18 +336,18 @@ def load_and_generate(model_path, json_dir, output_dir):
         }
         
         # Extract base filename components
-        step_number = re.search(r'step=(\d+)', model_path).group(1)  # Adjust regex as needed
-        json_filename = os.path.splitext(os.path.basename(json_file))[0]
-        bird_species = data['birdSpecies'].replace(' ', '_')
+        step_number = re.search(r'step=(\d+)', model_path).group(1)
+        bird_species = conditions['birdSpecies'].replace(' ', '_')
+        base_filename = f"{bird_species}_{os.path.splitext(json_filename)[0]}_{step_number}_cfg_scale_"
         
-        base_filename = f"{bird_species}_{json_filename}_{step_number}_cfg_scale_"
+
         
         #An array of cfg scale values to test
         cfg_scales = [0.5, 1.0, 2.0, 4.0, 6.0, 8.0]
         
         # Generate audio we do this 4 times with a loop
         for i in range(5):
-            generate_cond(prompt = "",
+            generate_cond_with_path(prompt = "",
             negative_prompt="",
             seconds_start=0,
             seconds_total=22,
@@ -364,26 +382,28 @@ def load_and_generate(model_path, json_dir, output_dir):
             destination_folder=output_dir,
             file_name=base_filename + str(cfg_scales[i]))
             
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_config', type=str, help='Path to model configuration file')
-    parser.add_argument('--model_ckpt_path', type=str, help='Path to model checkpoint file')
-    parser.add_argument('--pretrained_name', type=str, help='Name of pretrained model')
-    parser.add_argument('--pretransform_ckpt_path', type=str, help='Path to pretransform checkpoint file')
-    parser.add_argument('--output_dir', type=str, help='Path to output directory')
-    parser.add_argument('--json_dir', type=str, help='Path to directory containing JSON files')
-    args = parser.parse_args()
+            
+def runTests(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, json_dir=None, output_dir=None):
+    assert (pretrained_name is not None) ^ (model_config_path is not None and ckpt_path is not None), "Must specify either pretrained name or provide a model config and checkpoint, but not both"
+
+    if model_config_path is not None:
+        # Load config from json file
+        with open(model_config_path) as f:
+            model_config = json.load(f)
+    else:
+        model_config = None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.pretrained_name:
-        model, model_config = load_model(pretrained_name=args.pretrained_name, device=device)
-    else:
-        with open(args.model_config) as f:
-            model_config = json.load(f)
-        model, model_config = load_model(model_config=model_config, model_ckpt_path=args.model_ckpt_path, pretransform_ckpt_path=args.pretransform_ckpt_path, device=device)
-        
-    # Ensure output directory exists
-    os.makedirs(args.output_dir, exist_ok=True)
+    _, model_config = load_model(model_config, ckpt_path, pretrained_name=pretrained_name, pretransform_ckpt_path=pretransform_ckpt_path, model_half=model_half, device=device)
+
+        # Ensure output directory exists-    os.makedirs(args.output_dir, exist_ok=True)
 
     # Process all JSON files and generate audio
-    load_and_generate(args.model_ckpt_path, args.json_dir, args.output_dir)    
+    load_and_generate(ckpt_path, json_dir, output_dir)  
+
+
+
+
+            
+
+ 
