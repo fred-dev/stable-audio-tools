@@ -343,10 +343,10 @@ def load_and_generate(model_path, json_dir, output_dir):
 
         
         #An array of cfg scale values to test
-        cfg_scales = [0.5, 1.0, 2.0, 4.0, 6.0, 8.0]
+        cfg_scales = [1.8, 2.5, 4.0, 5.0, 12.0]
         
         # Generate audio we do this 4 times with a loop
-        for i in range(5):
+        for scale in cfg_scales:
             generate_cond_with_path(prompt = "",
             negative_prompt="",
             seconds_start=0,
@@ -359,7 +359,7 @@ def load_and_generate(model_path, json_dir, output_dir):
             pressure = conditions['pressure'],
             minutes_of_day = conditions['minutes_of_day'],
             day_of_year = conditions['day_of_year'],
-            cfg_scale=cfg_scales[i],
+            cfg_scale=scale,
             steps=250,
             preview_every=None,
             seed=-1,
@@ -380,7 +380,7 @@ def load_and_generate(model_path, json_dir, output_dir):
             mask_marination=None,
             batch_size=1,
             destination_folder=output_dir,
-            file_name=base_filename + str(cfg_scales[i]))
+            file_name=base_filename + str(scale))
             
             
 def runTests(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, json_dir=None, output_dir=None):
