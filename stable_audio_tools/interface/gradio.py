@@ -56,8 +56,6 @@ def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pr
     return model, model_config
 
 def generate_cond(
-        prompt,
-        negative_prompt=None,
         seconds_start=0,
         seconds_total=30,
         latitude = 0.0,
@@ -94,7 +92,6 @@ def generate_cond(
         torch.cuda.empty_cache()
     gc.collect()
 
-    print(f"Prompt: {prompt}")
 
     global preview_images
     preview_images = []
@@ -102,12 +99,7 @@ def generate_cond(
         preview_every = None
 
     # Return fake stereo audio
-    conditioning = [{"prompt": prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total }] * batch_size
-
-    if negative_prompt:
-        negative_conditioning = [{"prompt": negative_prompt, "latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total}] * batch_size
-    else:
-        negative_conditioning = None
+    conditioning = [{"latitude": -latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total }] * batch_size
         
     #Get the device from the model
     device = next(model.parameters()).device
@@ -175,7 +167,6 @@ def generate_cond(
     audio = generate_diffusion_cond(
         model, 
         conditioning=conditioning,
-        negative_conditioning=negative_conditioning,
         steps=steps,
         cfg_scale=cfg_scale,
         batch_size=batch_size,
@@ -382,7 +373,7 @@ def create_uncond_sampling_ui(model_config):
             audio_spectrogram_output
         ], 
         api_name="generate")
-def create_conditioning_slider(min_val, max_val, label):
+def create_conditioning_slider(min_val, max_val, default_value, label):
     """
     Create a Gradio slider for a given conditioning parameter.
 
@@ -395,15 +386,13 @@ def create_conditioning_slider(min_val, max_val, label):
     - A gr.Slider object configured according to the provided parameters.
     """
     step = (max_val - min_val) / 1000
-    default_val = (max_val + min_val) / 2
+    default_val = default_value
     print(f"Creating slider for {label} with min_val={min_val}, max_val={max_val}, step={step}, default_val={default_val}")
     return gr.Slider(minimum=min_val, maximum=max_val, step=step, value=default_val, label=label)
 
-def create_sampling_ui(model_config, inpainting=False):
+def create_sampling_ui(model_config):
     with gr.Row():
-        with gr.Column(scale=6):
-            prompt = gr.Textbox(show_label=False, placeholder="Prompt")
-            negative_prompt = gr.Textbox(show_label=False, placeholder="Negative prompt")
+        
         generate_button = gr.Button("Generate", variant='primary', scale=1)
     
     model_conditioning_config = model_config["model"].get("conditioning", None)
@@ -424,17 +413,17 @@ def create_sampling_ui(model_config, inpainting=False):
                 
                 seconds_start_slider = gr.Slider(minimum=0, maximum=512, step=1, value=0, label="Seconds start", visible=has_seconds_start)
            
-                seconds_total_slider = gr.Slider(minimum=0, maximum=512, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
+                seconds_total_slider = gr.Slider(minimum=0, maximum=22, step=1, value=sample_size//sample_rate, label="Seconds total", visible=has_seconds_total)
             
             with gr.Row():
                 # Steps slider
-                steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=100, label="Steps")
+                steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=250, label="Steps")
 
                 # Preview Every slider
                 preview_every_slider = gr.Slider(minimum=0, maximum=100, step=1, value=0, label="Preview Every")
 
                 # CFG scale 
-                cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=0.2, label="CFG scale")
+                cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=4.0, label="CFG scale")
                 
             with gr.Accordion("Climate and location", open=True):
                 latitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "latitude"), None)
@@ -442,6 +431,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     latitude_slider = create_conditioning_slider(
                         min_val=latitude_config["config"]["min_val"],
                         max_val=latitude_config["config"]["max_val"],
+                        default_value = -29.8913,
                         label="latitude")
                     
                 longitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "longitude"), None)
@@ -449,6 +439,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     longitude_slider = create_conditioning_slider(
                         min_val=longitude_config["config"]["min_val"],
                         max_val=longitude_config["config"]["max_val"],
+                        default_value=152.4951,
                         label="longitude")
                     
                 temperature_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "temperature"), None)
@@ -456,6 +447,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     temperature_slider = create_conditioning_slider(
                         min_val=temperature_config["config"]["min_val"],
                         max_val=temperature_config["config"]["max_val"],
+                        default_value=22.05,
                         label="temperature")
                     
                 humidity_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "humidity"), None)
@@ -463,6 +455,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     humidity_slider = create_conditioning_slider(
                         min_val=humidity_config["config"]["min_val"],
                         max_val=humidity_config["config"]["max_val"],
+                        default_value=88,
                         label="humidity")
                     
                 wind_speed_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "wind_speed"), None)
@@ -470,6 +463,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     wind_speed_slider = create_conditioning_slider(
                         min_val=wind_speed_config["config"]["min_val"],
                         max_val=wind_speed_config["config"]["max_val"],
+                        default_value=0.54,
                         label="wind_speed")
                     
                 pressure_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "pressure"), None)
@@ -477,6 +471,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     pressure_slider = create_conditioning_slider(
                         min_val=pressure_config["config"]["min_val"],
                         max_val=pressure_config["config"]["max_val"],
+                        default_value=1021,
                         label="pressure")
                     
                 minutes_of_day_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "minutes_of_day"), None)
@@ -484,6 +479,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     minutes_of_day_slider = create_conditioning_slider(
                         min_val=minutes_of_day_config["config"]["min_val"],
                         max_val=minutes_of_day_config["config"]["max_val"],
+                        default_value=1354,
                         label="minutes_of_day")
                     
                 day_of_year_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "day_of_year"), None)
@@ -491,6 +487,7 @@ def create_sampling_ui(model_config, inpainting=False):
                     day_of_year_slider = create_conditioning_slider(
                         min_val=day_of_year_config["config"]["min_val"],
                         max_val=day_of_year_config["config"]["max_val"],
+                        default_value=342,
                         label="Day of year")
 
             with gr.Accordion("Sampler params", open=False):
@@ -502,97 +499,40 @@ def create_sampling_ui(model_config, inpainting=False):
                 with gr.Row():
                     sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-2m-sde")
                     sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma min")
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=200.0, step=0.1, value=80, label="Sigma max")
-                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.2, label="CFG rescale amount")
+                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=200.0, step=0.1, value=50, label="Sigma max")
+                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.4, label="CFG rescale amount")
 
-            if inpainting: 
-                # Inpainting Tab
-                with gr.Accordion("Inpainting", open=False):
-                    sigma_max_slider.maximum=1000
-                    
-                    init_audio_checkbox = gr.Checkbox(label="Do inpainting")
-                    init_audio_input = gr.Audio(label="Init audio")
-                    init_noise_level_slider = gr.Slider(minimum=0.1, maximum=100.0, step=0.1, value=80, label="Init audio noise level", visible=False) # hide this
+            
+            # Default generation tab
+            with gr.Accordion("Init audio", open=False):
+                init_audio_input = gr.Audio(label="Init audio")
+                init_noise_level_slider = gr.Slider(minimum=0.1, maximum=100.0, step=0.01, value=1.0, label="Init noise level")
 
-                    mask_cropfrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Crop From %")
-                    mask_pastefrom_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Paste From %")
-                    mask_pasteto_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="Paste To %")
-
-                    mask_maskstart_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=50, label="Mask Start %")
-                    mask_maskend_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=100, label="Mask End %")
-                    mask_softnessL_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Softmask Left Crossfade Length %")
-                    mask_softnessR_slider = gr.Slider(minimum=0.0, maximum=100.0, step=0.1, value=0, label="Softmask Right Crossfade Length %")
-                    mask_marination_slider = gr.Slider(minimum=0.0, maximum=1, step=0.0001, value=0, label="Marination level", visible=False) # still working on the usefulness of this 
-
-                    inputs = [prompt, 
-                        negative_prompt,
-                        seconds_start_slider, 
-                        seconds_total_slider,
-                        latitude_slider,
-                        longitude_slider,
-                        temperature_slider,
-                        humidity_slider,
-                        wind_speed_slider,
-                        pressure_slider,
-                        minutes_of_day_slider,
-                        day_of_year_slider, 
-                        cfg_scale_slider, 
-                        steps_slider, 
-                        preview_every_slider, 
-                        seed_textbox, 
-                        sampler_type_dropdown, 
-                        sigma_min_slider, 
-                        sigma_max_slider,
-                        cfg_rescale_slider,
-                        init_audio_checkbox,
-                        init_audio_input,
-                        init_noise_level_slider,
-                        mask_cropfrom_slider,
-                        mask_pastefrom_slider,
-                        mask_pasteto_slider,
-                        mask_maskstart_slider,
-                        mask_maskend_slider,
-                        mask_softnessL_slider,
-                        mask_softnessR_slider,
-                        mask_marination_slider
-                    ]
-            else:
-                # Default generation tab
-                with gr.Accordion("Init audio", open=False):
-                    init_audio_checkbox = gr.Checkbox(label="Use init audio")
-                    init_audio_input = gr.Audio(label="Init audio")
-                    init_noise_level_slider = gr.Slider(minimum=0.1, maximum=100.0, step=0.01, value=0.1, label="Init noise level")
-
-                    inputs = [prompt, 
-                        negative_prompt,
-                        seconds_start_slider, 
-                        seconds_total_slider, 
-                        latitude_slider,
-                        longitude_slider,
-                        temperature_slider,
-                        humidity_slider,
-                        wind_speed_slider,
-                        pressure_slider,
-                        minutes_of_day_slider,
-                        day_of_year_slider,
-                        cfg_scale_slider, 
-                        steps_slider, 
-                        preview_every_slider, 
-                        seed_textbox, 
-                        sampler_type_dropdown, 
-                        sigma_min_slider, 
-                        sigma_max_slider,
-                        cfg_rescale_slider,
-                        init_audio_checkbox,
-                        init_audio_input,
-                        init_noise_level_slider
-                    ]
+                inputs = [
+                    seconds_start_slider, 
+                    seconds_total_slider, 
+                    latitude_slider,
+                    longitude_slider,
+                    temperature_slider,
+                    humidity_slider,
+                    wind_speed_slider,
+                    pressure_slider,
+                    minutes_of_day_slider,
+                    day_of_year_slider,
+                    cfg_scale_slider, 
+                    steps_slider, 
+                    preview_every_slider, 
+                    seed_textbox, 
+                    sampler_type_dropdown, 
+                    sigma_min_slider, 
+                    sigma_max_slider,
+                    cfg_rescale_slider,
+                    init_noise_level_slider
+                ]
 
         with gr.Column():
             audio_output = gr.Audio(label="Output audio", interactive=False)
             audio_spectrogram_output = gr.Gallery(label="Output spectrogram", show_label=False)
-            send_to_init_button = gr.Button("Send to init audio", scale=1)
-            send_to_init_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[init_audio_input])
     
     generate_button.click(fn=generate_cond, 
         inputs=inputs,
@@ -607,8 +547,8 @@ def create_txt2audio_ui(model_config):
     with gr.Blocks() as ui:
         with gr.Tab("Generation"):
             create_sampling_ui(model_config) 
-        with gr.Tab("Inpainting"):
-            create_sampling_ui(model_config, inpainting=True)    
+        # with gr.Tab("Inpainting"):
+        #     create_sampling_ui(model_config, inpainting=True)    
     return ui
 
 def create_diffusion_uncond_ui(model_config):
