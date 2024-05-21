@@ -338,7 +338,7 @@ def load_and_generate(model_path, json_dir, output_dir):
         # Extract base filename components
         step_number = re.search(r'step=(\d+)', model_path).group(1)
         bird_species = conditions['birdSpecies'].replace(' ', '_')
-        base_filename = f"{bird_species}_{os.path.splitext(json_filename)[0]}_{step_number}_cfg_scale_"
+        base_filename = f"{os.path.splitext(json_filename)[0]}_{step_number}_{bird_species}_cfg_scale_"
         
 
         
