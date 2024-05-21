@@ -343,7 +343,7 @@ def load_and_generate(model_path, json_dir, output_dir):
 
         
         #An array of cfg scale values to test
-        cfg_scales = [3.0, 6.0, 8.0, 10.0, 13.0]
+        cfg_scales = [2.0, 3.0, 16.0, 18.0, 21.0]
         
         # Generate audio we do this 4 times with a loop
         for scale in cfg_scales:
