@@ -58,8 +58,6 @@ def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pr
     return model, model_config
 
 def generate_cond_with_path(
-        prompt,
-        negative_prompt=None,
         seconds_start=0,
         seconds_total=30,
         latitude = 0.0,
@@ -98,7 +96,6 @@ def generate_cond_with_path(
         torch.cuda.empty_cache()
     gc.collect()
 
-    print(f"Prompt: {prompt}")
 
     global preview_images
     preview_images = []
@@ -106,13 +103,14 @@ def generate_cond_with_path(
         preview_every = None
 
     # Return fake stereo audio
-    conditioning = [{"prompt": prompt, "latitude": latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total }] * batch_size
+    conditioning = [{"latitude": latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total }] * batch_size
 
-    if negative_prompt:
-        negative_conditioning = [{"prompt": negative_prompt, "latitude": latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total}] * batch_size
-    else:
-        negative_conditioning = None
-        
+    # if negative_prompt:
+    #     negative_conditioning = [{ "latitude": latitude, "longitude": longitude, "temperature": temperature, "humidity": humidity, "wind_speed": wind_speed, "pressure": pressure, "minutes_of_day": minutes_of_day,"day_of_year": day_of_year, "seconds_start":seconds_start, "seconds_total": seconds_total}] * batch_size
+    # else:
+    #     negative_conditioning = None
+    
+    negative_conditioning = None
     #Get the device from the model
     device = next(model.parameters()).device
 
@@ -343,12 +341,11 @@ def load_and_generate(model_path, json_dir, output_dir):
 
         
         #An array of cfg scale values to test
-        cfg_scales = [2.0, 3.0, 16.0, 18.0, 21.0]
+        cfg_scales = [1.0, 2.0, 3.0, 4.0, 5.0]
         
         # Generate audio we do this 4 times with a loop
         for scale in cfg_scales:
-            generate_cond_with_path(prompt = "",
-            negative_prompt="",
+            generate_cond_with_path(
             seconds_start=0,
             seconds_total=22,
             latitude = conditions['latitude'],

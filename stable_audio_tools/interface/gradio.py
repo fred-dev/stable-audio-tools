@@ -18,9 +18,59 @@ from ..models.utils import load_ckpt_state_dict
 from ..inference.utils import prepare_audio
 from ..training.utils import copy_state_dict
 
+# Define preset values
+presets = {
+    "Pied Currawong": {
+        "latitude": -33.6467,
+        "longitude": 150.3246,
+        "temperature": 12.43,
+        "humidity": 86,
+        "wind_speed": 0.66,
+        "pressure": 1013,
+        "minutes_of_day": 369,
+        "day_of_year": 297,
+    },
+    "Yellow-tailed Black Cockatoo": {
+        "latitude": -32.8334,
+        "longitude": 150.2001,
+        "temperature": 23.23,
+        "humidity": 45,
+        "wind_speed": 1.37,
+        "pressure": 1009,
+        "minutes_of_day": 986,
+        "day_of_year": 78,
+    },
+    "Australian Magpie": {
+        "latitude": -38.522,
+        "longitude": 145.3365,
+        "temperature": 18.75,
+        "humidity": 67,
+        "wind_speed": 1.5,
+        "pressure": 1023,
+        "minutes_of_day": 940,
+        "day_of_year": 307,
+    },
+    "Laughing Kookaburra": {
+        "latitude": -27.2685099,
+        "longitude": 152.8587437,
+        "temperature": 9.02,
+        "humidity": 94,
+        "wind_speed": 1.5,
+        "pressure": 1025,
+        "minutes_of_day": 320,
+        "day_of_year": 236,
+    }
+}
+
+def update_sliders(preset_name):
+    preset = presets[preset_name]
+    return (preset["latitude"], preset["longitude"], preset["temperature"], preset["humidity"], preset["wind_speed"], preset["pressure"], preset["minutes_of_day"], preset["day_of_year"])
+
+
 model = None
 sample_rate = 44100
 sample_size = 524288
+
 
 def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, device="cuda", model_half=False):
     global model, sample_rate, sample_size
@@ -426,6 +476,8 @@ def create_sampling_ui(model_config):
                 cfg_scale_slider = gr.Slider(minimum=0.0, maximum=25.0, step=0.1, value=4.0, label="CFG scale")
                 
             with gr.Accordion("Climate and location", open=True):
+                preset_dropdown = gr.Dropdown(choices=list(presets.keys()), label="Select Preset")
+
                 latitude_config = next((item for item in model_conditioning_config["configs"] if item["id"] == "latitude"), None)
                 if latitude_config:
                     latitude_slider = create_conditioning_slider(
@@ -542,6 +594,20 @@ def create_sampling_ui(model_config):
         ], 
         api_name="generate")
 
+    preset_dropdown.change(
+        fn=update_sliders,
+        inputs=[preset_dropdown],
+        outputs=[
+            latitude_slider,
+            longitude_slider,
+            temperature_slider,
+            humidity_slider,
+            wind_speed_slider,
+            pressure_slider,
+            minutes_of_day_slider,
+            day_of_year_slider
+        ]
+    )
 
 def create_txt2audio_ui(model_config):
     with gr.Blocks() as ui:
