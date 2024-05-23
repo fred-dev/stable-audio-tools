@@ -341,7 +341,7 @@ def load_and_generate(model_path, json_dir, output_dir):
 
         
         #An array of cfg scale values to test
-        cfg_scales = [1.0, 2.0, 3.0, 4.0, 5.0]
+        cfg_scales = [2.0, 3.0, 4.0, 5.0, 6.7]
         
         # Generate audio we do this 4 times with a loop
         for scale in cfg_scales:
@@ -362,7 +362,7 @@ def load_and_generate(model_path, json_dir, output_dir):
             seed=-1,
             sampler_type="dpmpp-2m-sde",
             sigma_min=0.03,
-            sigma_max=50,
+            sigma_max=80,
             cfg_rescale=0.4,
             use_init=False,
             init_audio=None,
