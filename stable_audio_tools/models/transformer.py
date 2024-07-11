@@ -11,7 +11,9 @@ from typing import Callable, Literal
 
 try:
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
-except ImportError:
+except ImportError as e:
+    print(e)
+    print('flash_attn not installed, disabling Flash Attention')
     flash_attn_kvpacked_func = None
     flash_attn_func = None
 
@@ -274,7 +276,7 @@ class Attention(nn.Module):
         dim_context = None,
         causal = False,
         zero_init_output=True,
-        qk_norm = False,
+        qk_norm: Literal['l2', 'ln', 'none'] = 'none',
         natten_kernel_size = None
     ):
         super().__init__()
@@ -300,6 +302,10 @@ class Attention(nn.Module):
 
         self.qk_norm = qk_norm
 
+        if self.qk_norm == "ln":
+            self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+            self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+
         # Using 1d neighborhood attention
         self.natten_kernel_size = natten_kernel_size
         if natten_kernel_size is not None:
@@ -324,9 +330,14 @@ class Attention(nn.Module):
             causal = None
     ):
         batch, heads, q_len, _, k_len, device = *q.shape, k.shape[-2], q.device
-        
+        kv_heads = k.shape[1]
         # Recommended for multi-query single-key-value attention by Tri Dao
         # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
+
+        if heads != kv_heads:
+            # Repeat interleave kv_heads to match q_heads
+            heads_per_kv_head = heads // kv_heads
+            k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
 
         if k.ndim == 3:
             k = rearrange(k, 'b ... -> b 1 ...').expand_as(q)
@@ -409,9 +420,12 @@ class Attention(nn.Module):
             q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
         
         # Normalize q and k for cosine sim attention
-        if self.qk_norm:
+        if self.qk_norm == "l2":
             q = F.normalize(q, dim=-1)
             k = F.normalize(k, dim=-1)
+        elif self.qk_norm == "ln":
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         if rotary_pos_emb is not None and not has_context:
             freqs, _ = rotary_pos_emb
@@ -474,11 +488,12 @@ class Attention(nn.Module):
         elif self.use_fa_flash:
             assert final_attn_mask is None, 'masking not yet supported for Flash Attention 2'
             # Flash Attention 2 requires FP16 inputs
-            dtype_in = q.dtype
-            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d').half(), (q, k, v))
-            out = flash_attn_func(q, k, v, causal = causal).to(dtype_in)
-
-            out = rearrange(out, 'b n h d -> b h n d')
+            fa_dtype_in = q.dtype
+            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d').to(torch.float16), (q, k, v))
+            
+            out = flash_attn_func(q, k, v, causal = causal)
+            
+            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
 
         # Fall back to PyTorch implementation
         elif self.use_pt_flash:
@@ -486,6 +501,11 @@ class Attention(nn.Module):
 
         else:
             # Fall back to custom implementation
+
+            if h != kv_h:
+                # Repeat interleave kv_heads to match q_heads
+                heads_per_kv_head = h // kv_h
+                k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
 
             scale = 1. / (q.shape[-1] ** 0.5)
 
@@ -513,6 +533,11 @@ class Attention(nn.Module):
         out = rearrange(out, ' b h n d -> b n (h d)')
 
         # Communicate between heads
+        
+        # with autocast(enabled = False):
+        #     out_dtype = out.dtype
+        #     out = out.to(torch.float32)
+        #     out = self.to_out(out).to(out_dtype)
         out = self.to_out(out)
 
         if mask is not None:
@@ -737,9 +762,14 @@ class ContinuousTransformer(nn.Module):
         prepend_embeds = None,
         prepend_mask = None,
         global_cond = None,
+        return_info = False,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
+
+        info = {
+            "hidden_states": [],
+        }
 
         x = self.project_in(x)
 
@@ -763,13 +793,20 @@ class ContinuousTransformer(nn.Module):
         else:
             rotary_pos_emb = None
 
-        if self.use_sinusoidal_emb:
+        if self.use_sinusoidal_emb or self.use_abs_pos_emb:
             x = x + self.pos_emb(x)
 
         # Iterate over the transformer layers
         for layer in self.layers:
+            #x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, **kwargs)
             x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, **kwargs)
+
+            if return_info:
+                info["hidden_states"].append(x)
 
         x = self.project_out(x)
 
+        if return_info:
+            return x, info
+        
         return x

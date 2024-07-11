@@ -1,4 +1,6 @@
 import gc
+import platform
+
 import numpy as np
 import gradio as gr
 import json 
@@ -120,10 +122,10 @@ def generate_cond(
         steps=250,
         preview_every=None,
         seed=-1,
-        sampler_type="dpmpp-2m-sde",
+        sampler_type="dpmpp-3m-sde",
         sigma_min=0.03,
-        sigma_max=50,
-        cfg_rescale=0.4,
+        sigma_max=1000,
+        cfg_rescale=0.0,
         use_init=False,
         init_audio=None,
         init_noise_level=1.0,
@@ -247,9 +249,9 @@ def generate_cond(
 def generate_uncond(
         steps=250,
         seed=-1,
-        sampler_type="dpmpp-2m-sde",
+        sampler_type="dpmpp-3m-sde",
         sigma_min=0.03,
-        sigma_max=50,
+        sigma_max=1000,
         use_init=False,
         init_audio=None,
         init_noise_level=1.0,
@@ -392,9 +394,9 @@ def create_uncond_sampling_ui(model_config):
 
             # Sampler params
                 with gr.Row():
-                    sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-2m-sde")
+                    sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-3m-sde")
                     sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma min")
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=200.0, step=0.1, value=80, label="Sigma max")
+                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma max")
 
             with gr.Accordion("Init audio", open=False):
                 init_audio_checkbox = gr.Checkbox(label="Use init audio")
@@ -549,10 +551,10 @@ def create_sampling_ui(model_config):
 
                 # Sampler params
                 with gr.Row():
-                    sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-2m-sde")
+                    sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-3m-sde")
                     sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma min")
-                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=200.0, step=0.1, value=50, label="Sigma max")
-                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.4, label="CFG rescale amount")
+                    sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma max")
+                    cfg_rescale_slider = gr.Slider(minimum=0.0, maximum=1, step=0.01, value=0.0, label="CFG rescale amount")
 
             
             # Default generation tab
@@ -725,9 +727,9 @@ def create_diffusion_prior_ui(model_config):
         # Sampler params
         with gr.Row():
             steps_slider = gr.Slider(minimum=1, maximum=500, step=1, value=100, label="Steps")
-            sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-2m-sde")
+            sampler_type_dropdown = gr.Dropdown(["dpmpp-2m-sde", "dpmpp-3m-sde", "k-heun", "k-lms", "k-dpmpp-2s-ancestral", "k-dpm-2", "k-dpm-fast"], label="Sampler type", value="dpmpp-3m-sde")
             sigma_min_slider = gr.Slider(minimum=0.0, maximum=2.0, step=0.01, value=0.03, label="Sigma min")
-            sigma_max_slider = gr.Slider(minimum=0.0, maximum=200.0, step=0.1, value=80, label="Sigma max")
+            sigma_max_slider = gr.Slider(minimum=0.0, maximum=1000.0, step=0.1, value=500, label="Sigma max")
         process_button = gr.Button("Process", variant='primary', scale=1)
         process_button.click(fn=diffusion_prior_process, inputs=[input_audio, steps_slider, sampler_type_dropdown, sigma_min_slider, sigma_max_slider], outputs=output_audio, api_name="process")    
 
@@ -769,7 +771,21 @@ def create_ui(model_config_path=None, ckpt_path=None, pretrained_name=None, pret
     else:
         model_config = None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        has_mps = platform.system() == "Darwin" and torch.backends.mps.is_available()
+    except Exception:
+        # In case this version of Torch doesn't even have `torch.backends.mps`...
+        has_mps = False
+
+    if has_mps:
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    print("Using device:", device)
+
     _, model_config = load_model(model_config, ckpt_path, pretrained_name=pretrained_name, pretransform_ckpt_path=pretransform_ckpt_path, model_half=model_half, device=device)
     
     model_type = model_config["model_type"]
