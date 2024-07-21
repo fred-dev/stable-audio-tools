@@ -17,9 +17,6 @@ def create_model_from_config(model_config):
     elif model_type == 'diffusion_autoencoder':
         from .autoencoders import create_diffAE_from_config
         return create_diffAE_from_config(model_config)
-    elif model_type == 'musicgen':
-        from .musicgen import create_musicgen_from_config
-        return create_musicgen_from_config(model_config)
     elif model_type == 'lm':
         from .lm import create_audio_lm_from_config
         return create_audio_lm_from_config(model_config)
@@ -91,10 +88,10 @@ def create_bottleneck_from_config(bottleneck_config):
 
     if bottleneck_type == 'tanh':
         from .bottleneck import TanhBottleneck
-        return TanhBottleneck()
+        bottleneck = TanhBottleneck()
     elif bottleneck_type == 'vae':
         from .bottleneck import VAEBottleneck
-        return VAEBottleneck()
+        bottleneck = VAEBottleneck()
     elif bottleneck_type == 'rvq':
         from .bottleneck import RVQBottleneck
 
@@ -110,11 +107,11 @@ def create_bottleneck_from_config(bottleneck_config):
 
         quantizer_params.update(bottleneck_config["config"])
 
-        return RVQBottleneck(**quantizer_params)
+        bottleneck = RVQBottleneck(**quantizer_params)
     elif bottleneck_type == "dac_rvq":
         from .bottleneck import DACRVQBottleneck
 
-        return DACRVQBottleneck(**bottleneck_config["config"])
+        bottleneck = DACRVQBottleneck(**bottleneck_config["config"])
     
     elif bottleneck_type == 'rvq_vae':
         from .bottleneck import RVQVAEBottleneck
@@ -131,19 +128,26 @@ def create_bottleneck_from_config(bottleneck_config):
 
         quantizer_params.update(bottleneck_config["config"])
 
-        return RVQVAEBottleneck(**quantizer_params)
+        bottleneck = RVQVAEBottleneck(**quantizer_params)
         
     elif bottleneck_type == 'dac_rvq_vae':
         from .bottleneck import DACRVQVAEBottleneck
-        return DACRVQVAEBottleneck(**bottleneck_config["config"])
+        bottleneck = DACRVQVAEBottleneck(**bottleneck_config["config"])
     elif bottleneck_type == 'l2_norm':
         from .bottleneck import L2Bottleneck
-        return L2Bottleneck()
+        bottleneck = L2Bottleneck()
     elif bottleneck_type == "wasserstein":
         from .bottleneck import WassersteinBottleneck
-        return WassersteinBottleneck(**bottleneck_config.get("config", {}))
+        bottleneck = WassersteinBottleneck(**bottleneck_config.get("config", {}))
     elif bottleneck_type == "fsq":
         from .bottleneck import FSQBottleneck
-        return FSQBottleneck(**bottleneck_config["config"])
+        bottleneck = FSQBottleneck(**bottleneck_config["config"])
     else:
         raise NotImplementedError(f'Unknown bottleneck type: {bottleneck_type}')
+    
+    requires_grad = bottleneck_config.get('requires_grad', True)
+    if not requires_grad:
+        for param in bottleneck.parameters():
+            param.requires_grad = False
+
+    return bottleneck

@@ -198,13 +198,18 @@ class AudiocraftCompressionPretransform(Pretransform):
     def __init__(self, model_type="facebook/encodec_32khz", scale=1.0, quantize_on_decode: bool = True):
         super().__init__(enable_grad=False, io_channels=1, is_discrete=True)
         
-        from audiocraft.models import CompressionModel
+        try:
+            from audiocraft.models import CompressionModel
+        except ImportError:
+            raise ImportError("Audiocraft is not installed. Please install audiocraft to use Audiocraft models.")
                
         self.model = CompressionModel.get_pretrained(model_type)
 
         self.quantize_on_decode = quantize_on_decode
 
         self.downsampling_ratio = round(self.model.sample_rate / self.model.frame_rate)
+
+        self.sample_rate = self.model.sample_rate
 
         self.io_channels = self.model.channels
 

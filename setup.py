@@ -2,13 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name='stable-audio-tools',
-    version='0.0.12',
+    version='0.0.16',
     url='https://github.com/Stability-AI/stable-audio-tools.git',
     author='Stability AI',
     description='Training and inference tools for generative audio models from Stability AI',
     packages=find_packages(),  
     install_requires=[
-        'audiocraft==1.0.0',
         'aeiou==0.0.20',
         'alias-free-torch==0.0.6',
         'auraloss==0.4.0',
@@ -17,7 +16,6 @@ setup(
         'einops-exts==0.0.4',
         'ema-pytorch==0.2.3',
         'encodec==0.1.1',
-        'flash-attn>=2.5.0',
         'gradio>=3.42.0',
         'huggingface_hub',
         'importlib-resources==5.12.0',
@@ -36,7 +34,7 @@ setup(
         'torchaudio>=2.0.2',
         'torchmetrics==0.11.4',
         'tqdm',
-        'transformers==4.33.3',
+        'transformers',
         'v-diffusion-pytorch==0.0.2',
         'vector-quantize-pytorch==1.9.14',
         'wandb==0.15.4',

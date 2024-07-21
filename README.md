@@ -18,6 +18,38 @@ Requires PyTorch 2.0 or later for Flash Attention support
 
 Development for the repo is done in Python 3.8.10
 
+# Interface
+
+A basic Gradio interface is provided to test out trained models. 
+
+For example, to create an interface for the [`stable-audio-open-1.0`](https://huggingface.co/stabilityai/stable-audio-open-1.0) model, once you've accepted the terms for the model on Hugging Face, you can run:
+```bash
+$ python3 ./run_gradio.py --pretrained-name stabilityai/stable-audio-open-1.0
+```
+
+The `run_gradio.py` script accepts the following command line arguments:
+
+- `--pretrained-name`
+  - Hugging Face repository name for a Stable Audio Tools model
+  - Will prioritize `model.safetensors` over `model.ckpt` in the repo
+  - Optional, used in place of `model-config` and `ckpt-path` when using pre-trained model checkpoints on Hugging Face
+- `--model-config`
+  - Path to the model config file for a local model
+- `--ckpt-path`
+  - Path to unwrapped model checkpoint file for a local model
+- `--pretransform-ckpt-path` 
+  - Path to an unwrapped pretransform checkpoint, replaces the pretransform in the model, useful for testing out fine-tuned decoders
+  - Optional
+- `--share`
+  - If true, a publicly shareable link will be created for the Gradio demo
+  - Optional
+- `--username` and `--password`
+  - Used together to set a login for the Gradio demo
+  - Optional
+- `--model-half`
+  - If true, the model weights to half-precision
+  - Optional
+
 # Training
 
 ## Prerequisites
@@ -105,7 +137,7 @@ The model config file defines all of the information needed to load a model for 
 The following properties are defined in the top level of the model configuration:
 
 - `model_type`
-  - The type of model being defined, currently limited to one of `"autoencoder", "diffusion_uncond", "diffusion_cond", "diffusion_cond_inpaint", "diffusion_autoencoder", "musicgen"`.
+  - The type of model being defined, currently limited to one of `"autoencoder", "diffusion_uncond", "diffusion_cond", "diffusion_cond_inpaint", "diffusion_autoencoder", "lm"`.
 - `sample_size`
   - The length of the audio provided to the model during training, in samples. For diffusion models, this is also the raw audio sample length used for inference.
 - `sample_rate`
@@ -121,7 +153,5 @@ The following properties are defined in the top level of the model configuration
 `stable-audio-tools` currently supports two kinds of data sources: local directories of audio files, and WebDataset datasets stored in Amazon S3. More information can be found in [the dataset config documentation](docs/datasets.md)
 
 # Todo
-- [ ] Add documentation for different model types
-- [ ] Add documentation for Gradio interface
 - [ ] Add troubleshooting section
 - [ ] Add contribution guidelines 
