@@ -302,11 +302,10 @@ def load_and_generate(model_path, json_dir, output_dir):
     files = os.listdir(json_dir)
     
     #make a subdirectory in the json_dir called done to move the files that have been processed
+    # Make a subdirectory in the json_dir called done to move the files that have been processed
     done_dir = os.path.join(json_dir, 'done')
     # Create the directory if it doesn't exist
-    if not os.path.exists(done_dir):
-        os.makedirs(done_dir)
-    
+    os.makedirs(done_dir, exist_ok=True)
     
     
     # Filter for JSON files
@@ -389,7 +388,9 @@ def load_and_generate(model_path, json_dir, output_dir):
             file_name=base_filename + str(scale))
             
             #when done move the file to the done directory
-            os.rename(json_file_path, os.path.join(done_dir, json_filename))
+            # Move the processed JSON file to the done directory
+        os.rename(json_file_path, os.path.join(done_dir, json_filename))
+        print(f"Moved {json_filename} to {done_dir}")
             
             
 def runTests(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, json_dir=None, output_dir=None):
