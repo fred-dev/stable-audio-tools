@@ -59,7 +59,7 @@ def load_model(model_config=None, model_ckpt_path=None, pretrained_name=None, pr
 
 def generate_cond_with_path(
         seconds_start=0,
-        seconds_total=30,
+        seconds_total=11,
         latitude = 0.0,
         longitude = 0.0,
         temperature = 0.0,
@@ -297,8 +297,17 @@ def autoencoder_process(audio, latent_noise, n_quantizers):
 
 def load_and_generate(model_path, json_dir, output_dir):
     """Load JSON files and generate audio for each set of conditions."""
-    # List all files in the json_dir
+    # List all files in the json_dir but not in any     subdirectories
+    
     files = os.listdir(json_dir)
+    
+    #make a subdirectory in the json_dir called done to move the files that have been processed
+    done_dir = os.path.join(json_dir, 'done')
+    # Create the directory if it doesn't exist
+    if not os.path.exists(done_dir):
+        os.makedirs(done_dir)
+    
+    
     
     # Filter for JSON files
     json_files = [file for file in files if file.endswith('.json')]
@@ -341,13 +350,13 @@ def load_and_generate(model_path, json_dir, output_dir):
 
         
         #An array of cfg scale values to test
-        cfg_scales = [2.0, 3.0, 4.0, 5.0, 6.7]
+        cfg_scales = [2.0, 4.0, 8.0]
         
         # Generate audio we do this 4 times with a loop
         for scale in cfg_scales:
             generate_cond_with_path(
             seconds_start=0,
-            seconds_total=22,
+            seconds_total=11,
             latitude = conditions['latitude'],
             longitude = conditions['longitude'],
             temperature = conditions['temperature'],
@@ -378,6 +387,9 @@ def load_and_generate(model_path, json_dir, output_dir):
             batch_size=1,
             destination_folder=output_dir,
             file_name=base_filename + str(scale))
+            
+            #when done move the file to the done directory
+            os.rename(json_file_path, os.path.join(done_dir, json_filename))
             
             
 def runTests(model_config_path=None, ckpt_path=None, pretrained_name=None, pretransform_ckpt_path=None, model_half=False, json_dir=None, output_dir=None):
