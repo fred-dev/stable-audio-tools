@@ -1,6 +1,7 @@
 import torch
 import math
 import numpy as np
+import math
 
 from torch import nn, sin, pow
 from torch.nn import functional as F
@@ -18,7 +19,6 @@ from .diffusion import ConditionedDiffusionModel, DAU1DCondWrapper, UNet1DCondWr
 from .factory import create_pretransform_from_config, create_bottleneck_from_config
 from .pretransforms import Pretransform, AutoencoderPretransform
 from .transformer import ContinuousTransformer, TransformerBlock, RotaryEmbedding
-
 
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
@@ -55,7 +55,6 @@ def unfold_channels_from_batch(x, channels):
     x = rearrange(x, '(b c) ... -> b c ...', c = channels)
     return x
 
-
 class ResidualUnit(nn.Module):
     def __init__(self, in_channels, out_channels, dilation, use_snake=False, antialias_activation=False):
         super().__init__()
@@ -76,16 +75,17 @@ class ResidualUnit(nn.Module):
     def forward(self, x):
         res = x
         
-        x = checkpoint(self.layers, x)
-        #x = self.layers(x)
-
+        if self.training:
+            x = checkpoint(self.layers, x)
+        else:
+            x = self.layers(x)
 
 
 class Transpose(nn.Module):
     def __init__(self):
         super().__init__()
-    def forward(self, x):
-        return x.transpose(-1,-2)
+    def forward(self, x, **kwargs):
+        return rearrange(x, '... a b -> ... b a')
 
 class TAAEBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride, type = 'encoder', transformer_depth = 3, use_snake = False, sliding_window = [31,32], checkpointing = False, conformer = False, layer_scale = True, use_dilated_conv = False):
@@ -99,6 +99,8 @@ class TAAEBlock(nn.Module):
         transformers = []
         transformers.append(Transpose())
 
+        self.sliding_window = sliding_window
+
         for _ in range(transformer_depth):
             transformers.append(TransformerBlock(transformer_dim, 
                                                  dim_heads = 128, 
@@ -108,47 +110,49 @@ class TAAEBlock(nn.Module):
                                                  conformer = conformer, 
                                                  layer_scale = layer_scale, 
                                                  add_rope = True, 
-                                                 attn_kwargs={'sliding_window': sliding_window, 'qk_norm': "ln"}, 
+                                                 attn_kwargs={'qk_norm': "ln"}, 
                                                  ff_kwargs={'mult': 4, 'no_bias': False},
                                                  norm_kwargs = {'eps': 1e-2}))
         transformers.append(Transpose())
-        transformers = nn.Sequential(*transformers)
+        transformers = nn.ModuleList(transformers)
 
         if type == 'encoder':
             layers = []
-            if stride > 1 or in_channels != out_channels:
-                conv_type = WNConv1d
-            else:
-                conv_type = nn.Identity
             if use_dilated_conv:
                 layers.append(ResidualUnit(in_channels=in_channels, out_channels=in_channels, dilation=1, use_snake=use_snake))
                 layers.append(ResidualUnit(in_channels=in_channels, out_channels=in_channels, dilation=3, use_snake=use_snake))
                 layers.append(ResidualUnit(in_channels=in_channels, out_channels=in_channels, dilation=9, use_snake=use_snake))
             layers.append(get_activation("snake" if use_snake else "none", antialias=False, channels=in_channels))
-            layers.append(conv_type(in_channels=in_channels, out_channels=out_channels, kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)))
+            layers.append(WNConv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)) if stride > 1 else nn.Identity())
             layers.append(transformers)
-            self.layers = nn.Sequential(*layers)
+            self.layers = nn.ModuleList(layers)
         elif type == 'decoder':
             layers = []
-            if stride > 1 or in_channels != out_channels:
-                conv_type = WNConvTranspose1d
-            else:
-                conv_type = nn.Identity
             layers.append(transformers)
-            layers.append(get_activation("snake" if use_snake else "none", antialias=False, channels=in_channels))
-            layers.append(conv_type(in_channels=in_channels,
+            layers.append(get_activation("snake" if use_snake else "none", antialias=False, channels=out_channels))
+            layers.append(WNConvTranspose1d(in_channels=in_channels,
                           out_channels=out_channels,
-                          kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)))
+                          kernel_size=2*stride, stride=stride, padding=math.ceil(stride/2)) if stride > 1 else nn.Identity())
             if use_dilated_conv:
                 layers.append(ResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=1, use_snake=use_snake))
                 layers.append(ResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=3, use_snake=use_snake))
                 layers.append(ResidualUnit(in_channels=out_channels, out_channels=out_channels, dilation=9, use_snake=use_snake))
-            self.layers = nn.Sequential(*layers)
+            self.layers = nn.ModuleList(layers)
+
     def forward(self, x):
-        if self.checkpointing:
-            return checkpoint(self.layers, x)
-        else:
-            return self.layers(x)
+        for layer in self.layers:
+            if isinstance(layer, nn.ModuleList):
+                for transformer in layer:
+                    if self.checkpointing:
+                        x = checkpoint(transformer, x, self_attention_flash_sliding_window = self.sliding_window)
+                    else:
+                        x = transformer(x, self_attention_flash_sliding_window = self.sliding_window)
+            else:
+                if self.checkpointing:
+                    x = checkpoint(layer, x)
+                else:
+                    x = layer(x)
+        return x
 
 class TAAEEncoder(nn.Module):
     def __init__(self, 
@@ -288,6 +292,7 @@ class OobleckEncoder(nn.Module):
                  antialias_activation=False
         ):
         super().__init__()
+        self.in_channels = in_channels
           
         c_mults = [1] + c_mults
 
@@ -323,6 +328,7 @@ class OobleckDecoder(nn.Module):
                  use_nearest_upsample=False,
                  final_tanh=True):
         super().__init__()
+        self.out_channels = out_channels
 
         c_mults = [1] + c_mults
         
@@ -537,8 +543,7 @@ class AudioAutoencoder(nn.Module):
         latents = self.bottleneck.decode_tokens(tokens, **kwargs)
 
         return self.decode(latents, **kwargs)
-        
-    
+  
     def preprocess_audio_for_encoder(self, audio, in_sr):
         '''
         Preprocess single audio tensor (Channels x Length) to be compatible with the encoder.
@@ -612,7 +617,7 @@ class AudioAutoencoder(nn.Module):
         else:
             # CHUNKED ENCODING
             # samples_per_latent is just the downsampling ratio (which is also the upsampling ratio)
-            samples_per_latent = self.downsampling_ratio
+            samples_per_latent = int(self.downsampling_ratio)
             total_size = audio.shape[2] # in samples
             batch_size = audio.shape[0]
             chunk_size *= samples_per_latent # converting metric in latents to samples
@@ -633,7 +638,7 @@ class AudioAutoencoder(nn.Module):
             # However, the audio should've been padded to a multiple of samples_per_latent by now.
             y_size = total_size // samples_per_latent
             # Create an empty latent, we will populate it with chunks as we encode them
-            y_final = torch.zeros((batch_size,self.latent_dim,y_size)).to(audio.device)
+            y_final = torch.zeros((batch_size,self.latent_dim,y_size), dtype = chunks.dtype).to(audio.device)
             for i in range(num_chunks):
                 x_chunk = chunks[i,:]
                 # encode the chunk
@@ -674,10 +679,6 @@ class AudioAutoencoder(nn.Module):
         The chunk_size vs memory tradeoff isn't linear, and possibly depends on the GPU and CUDA version
         For example, on a A6000 chunk_size 128 is overall faster than 256 and 512 even though it has more chunks
         '''
-
-        model_dtype = next(self.parameters()).dtype
-        latents = latents.to(model_dtype)
-
         if not chunked:
             # default behavior. Decode the entire latent in parallel
             return self.decode(latents, **kwargs)
@@ -697,10 +698,10 @@ class AudioAutoencoder(nn.Module):
             chunks = torch.stack(chunks)
             num_chunks = chunks.shape[0]
             # samples_per_latent is just the downsampling ratio
-            samples_per_latent = self.downsampling_ratio
+            samples_per_latent = int(self.downsampling_ratio)
             # Create an empty waveform, we will populate it with chunks as decode them
             y_size = total_size * samples_per_latent
-            y_final = torch.zeros((batch_size,self.out_channels,y_size)).to(latents.device)
+            y_final = torch.zeros((batch_size,self.out_channels,y_size), dtype = chunks.dtype).to(latents.device)
             for i in range(num_chunks):
                 x_chunk = chunks[i,:]
                 # decode the chunk
