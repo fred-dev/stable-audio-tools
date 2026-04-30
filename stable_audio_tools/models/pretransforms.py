@@ -1,7 +1,16 @@
 import torch
 from einops import rearrange
 from torch import nn
-from torchaudio.transforms import Resample
+
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
+valid_autocast_device_types = {"cuda", "cpu"}
+autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
 
 class Pretransform(nn.Module):
     def __init__(self, enable_grad, io_channels, is_discrete):
@@ -287,9 +296,9 @@ class AudiocraftCompressionPretransform(Pretransform):
         # return self.model.decode(z)
 
     def tokenize(self, x):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(autocast_device_type, enabled=False):
             return self.model.encode(x.to(torch.float16))[0]
-    
+
     def decode_tokens(self, tokens):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(autocast_device_type, enabled=False):
             return self.model.decode(tokens)

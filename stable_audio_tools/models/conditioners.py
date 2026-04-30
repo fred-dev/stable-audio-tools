@@ -15,6 +15,16 @@ from .transformer import AbsolutePositionalEmbedding
 
 from torch import nn
 
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
+valid_autocast_device_types = {"cuda", "cpu"}
+autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
+
 class Conditioner(nn.Module):
     def __init__(
             self,
@@ -71,8 +81,8 @@ class NumberConditioner(Conditioner):
 
         self.embedder = NumberEmbedder(features=output_dim)
 
-    def forward(self, floats: tp.List[float], device=None) -> tp.Any:
-    
+    def forward(self, floats: tp.List[float], device=device) -> tp.Any:
+
             # Cast the inputs to floats
             floats = [float(x) for x in floats]
 
@@ -171,9 +181,10 @@ class CLAPTextConditioner(Conditioner):
         del self.model.model.audio_branch
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-    def get_clap_features(self, prompts, layer_ix=-2, device: tp.Any = "cuda"):
+    def get_clap_features(self, prompts, layer_ix=-2, device: tp.Any = device):
         prompt_tokens = self.model.tokenizer(prompts)
         attention_mask = prompt_tokens["attention_mask"].to(device=device, non_blocking=True)
         prompt_features = self.model.model.text_branch(
@@ -184,7 +195,7 @@ class CLAPTextConditioner(Conditioner):
 
         return prompt_features, attention_mask
 
-    def forward(self, texts: tp.List[str], device: tp.Any = "cuda") -> tp.Any:
+    def forward(self, texts: tp.List[str], device: tp.Any = device) -> tp.Any:
         self.model.to(device)
 
         if self.use_text_features:
@@ -226,8 +237,6 @@ class CLAPAudioConditioner(Conditioner):
                  project_out: bool = False):
         super().__init__(512, output_dim, project_out=project_out)
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         # Suppress logging from transformers
         previous_level = logging.root.manager.disable
         logging.disable(logging.ERROR)
@@ -235,8 +244,9 @@ class CLAPAudioConditioner(Conditioner):
             warnings.simplefilter("ignore")
             try:
                 import laion_clap
-                
-                model = laion_clap.CLAP_Module(enable_fusion=enable_fusion, amodel=audio_model_type, device='cpu')
+                from laion_clap.clap_module.factory import load_state_dict as clap_load_state_dict
+
+                model = laion_clap.CLAP_Module(enable_fusion=enable_fusion, amodel=audio_model_type, device=device)
 
                 if self.finetune:
                     self.model = model
@@ -258,9 +268,10 @@ class CLAPAudioConditioner(Conditioner):
         del self.model.model.text_branch
 
         gc.collect()
-        torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-    def forward(self, audios: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]] , device: tp.Any = "cuda") -> tp.Any:
+    def forward(self, audios: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]] , device: tp.Any = device) -> tp.Any:
 
         self.model.to(device)
 
@@ -270,7 +281,7 @@ class CLAPAudioConditioner(Conditioner):
         # Convert to mono
         mono_audios = audios.mean(dim=1)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(autocast_device_type, enabled=False):
             audio_embedding = self.model.get_audio_embedding_from_data(mono_audios.float(), use_tensor=True)
 
         audio_embedding = audio_embedding.unsqueeze(1).to(device)
@@ -358,18 +369,13 @@ class T5Conditioner(Conditioner):
         attention_mask = encoded["attention_mask"].to(device).to(torch.bool)
 
         self.model.eval()
-            
-        with torch.cuda.amp.autocast(dtype=torch.float16) and torch.set_grad_enabled(self.enable_grad):
+
+        with torch.amp.autocast(autocast_device_type, dtype=torch.float16) and torch.set_grad_enabled(self.enable_grad):
             embeddings = self.model(
                 input_ids=input_ids, attention_mask=attention_mask
-            )["last_hidden_state"]    
+            )["last_hidden_state"]
 
-        # Cast embeddings to same type as proj_out, unless proj_out is Identity
-        if not isinstance(self.proj_out, nn.Identity):
-            proj_out_dtype = next(self.proj_out.parameters()).dtype
-            embeddings = embeddings.to(proj_out_dtype)
-
-        embeddings = self.proj_out(embeddings)
+        embeddings = self.proj_out(embeddings.float())
 
         embeddings = embeddings * attention_mask.unsqueeze(-1).float()
 

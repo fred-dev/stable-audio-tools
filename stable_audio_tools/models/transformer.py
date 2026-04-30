@@ -7,7 +7,18 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from torch.amp import autocast
 from typing import Callable, Literal
-from torch.nn.attention.flex_attention import flex_attention
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+# Ensure device.type is valid for autocast
+valid_autocast_device_types = {"cuda", "cpu"}
+autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
+
 
 try:
     from flash_attn import flash_attn_func
@@ -126,7 +137,7 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device = device)
         return self.forward(t)
 
-    @autocast("cuda", enabled = False)
+    @autocast(device_type=autocast_device_type, enabled=False)
     def forward(self, t):
         device = self.inv_freq.device
 
@@ -151,8 +162,9 @@ def rotate_half(x):
     x1, x2 = x.unbind(dim = -2)
     return torch.cat((-x2, x1), dim = -1)
 
-@autocast("cuda", enabled = False)
-def apply_rotary_pos_emb(t, freqs, scale = 1):
+
+@autocast(device_type=autocast_device_type, enabled=False)
+def apply_rotary_pos_emb(t, freqs, scale=1):
     out_dtype = t.dtype
 
     # cast to float32 if necessary for numerical stability
@@ -374,70 +386,97 @@ class Attention(nn.Module):
         if self.qk_norm == "ln":
             self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
             self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
-        elif self.qk_norm == 'dyt':
-            self.q_norm = DynamicTanh(dim_heads)
-            self.k_norm = DynamicTanh(dim_heads)
 
-        self.sdp_kwargs = dict(
-            enable_flash = True,
-            enable_math = True,
-            enable_mem_efficient = True
-        )
+        # Using 1d neighborhood attention
+        self.natten_kernel_size = natten_kernel_size
+        if natten_kernel_size is not None:
+            return
 
-        self.feat_scale = feat_scale
+        self.use_pt_flash = device.type == "cuda" and version.parse(
+            torch.__version__
+        ) >= version.parse("2.0.0")
 
-        if self.feat_scale:
-            self.lambda_dc = nn.Parameter(torch.zeros(dim))
-            self.lambda_hf = nn.Parameter(torch.zeros(dim))
+        self.use_fa_flash = device.type == "cuda" and flash_attn_func is not None
 
-        self.causal = causal
-        if causal:
-            print('Using `causal` argument disables FlexAttention. If you want to use them together, incorporate causal masking into `flex_attention_block_mask`.')
+        self.sdp_backends = [
+            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+            torch.nn.attention.SDPBackend.MATH,
+            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+        ]
 
-    @compile
-    def apply_qk_layernorm(self, q, k):
-        q_type = q.dtype
-        k_type = k.dtype
-        q = self.q_norm(q).to(q_type)
-        k = self.k_norm(k).to(k_type)
-        return q, k
+    def flash_attn(
+            self,
+            q, 
+            k, 
+            v,
+            mask = None,
+            causal = None
+    ):
+        batch, heads, q_len, _, k_len, device = *q.shape, k.shape[-2], q.device
+        kv_heads = k.shape[1]
+        # Recommended for multi-query single-key-value attention by Tri Dao
+        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
+        if heads != kv_heads:
+            # Repeat interleave kv_heads to match q_heads
+            heads_per_kv_head = heads // kv_heads
+            k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
 
-    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None):
+        if k.ndim == 3:
+            k = rearrange(k, 'b ... -> b 1 ...').expand_as(q)
 
-        if self.num_heads != self.kv_heads:
-             # Repeat interleave kv_heads to match q_heads for grouped query attention
-             heads_per_kv_head = self.num_heads // self.kv_heads
-             k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+        if v.ndim == 3:
+            v = rearrange(v, 'b ... -> b 1 ...').expand_as(q)
 
-        flash_attn_available = flash_attn_func is not None
-        if flash_attn_sliding_window is not None and (not flash_attn_available):
-            print(f"Cannot use FlashAttention sliding window as FlashAttention is disabled or not available")
+        causal = self.causal if causal is None else causal
 
-        if (flex_attention_block_mask is not None or flex_attention_score_mod is not None) and flash_attn_sliding_window is not None:
-            print(f"cannot use both FlashAttention and FlexAttention, favouring FlexAttention")
+        if q_len == 1 and causal:
+            causal = False
+        
+        if mask is not None:
+            assert mask.ndim == 4
+            mask = mask.expand(batch, heads, q_len, k_len)
 
-        if causal and (flex_attention_block_mask is not None or flex_attention_score_mod is not None):
-            print(f"Disabling FlexAttention because causal is set")
-            flex_attention_block_mask = None
-            flex_attention_score_mod = None
+        # handle kv cache - this should be bypassable in updated flash attention 2
 
-        if flex_attention_block_mask is not None or flex_attention_score_mod is not None:
-            out = flex_attention_compiled(q,k,v,
-                block_mask = flex_attention_block_mask,
-                score_mod = flex_attention_score_mod)        
-        elif flash_attn_available:
-            fa_dtype_in = q.dtype
-            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
+        if k_len > q_len and causal:
+            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
+            if mask is None:
+                mask = ~causal_mask
+            else:
+                mask = mask & ~causal_mask
+            causal = False
 
-            if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
-                q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
-            
-            out = flash_attn_func(q, k, v, causal = causal, window_size=flash_attn_sliding_window if (flash_attn_sliding_window is not None) else [-1,-1])
-            
-            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+        # manually handle causal mask, if another mask was given
+
+        row_is_entirely_masked = None
+
+        if mask is not None and causal:
+            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
+            mask = mask & ~causal_mask
+
+            # protect against an entire row being masked out
+
+            row_is_entirely_masked = ~mask.any(dim = -1)
+            mask[..., 0] = mask[..., 0] | row_is_entirely_masked
+
+            causal = False
+
+        if device.type == "cuda":
+            with torch.nn.attention.sdpa_kernel(self.sdp_backends):
+                out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=mask, is_causal=causal
+                )
         else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal = causal)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=causal
+            )
+
+        # for a row that is entirely masked out, should zero out the output of that row token
+
+        if row_is_entirely_masked is not None:
+            out = out.masked_fill(row_is_entirely_masked[..., None], 0.)
+
         return out
 
 

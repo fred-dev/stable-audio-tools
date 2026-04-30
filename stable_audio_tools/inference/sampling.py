@@ -5,6 +5,16 @@ import torch.distributions as dist
 
 import k_diffusion as K
 
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
+
+valid_autocast_device_types = {"cuda", "cpu"}
+autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
+
 # Define the noise schedule and sampling loop
 def get_alphas_sigmas(t):
     """Returns the scaling factors for the clean image (alpha) and for the
@@ -266,17 +276,9 @@ def sample(model, x, steps, eta, callback=None, sigma_max=1.0, dist_shift=None, 
     # The sampling loop
     for i in trange(steps):
 
-        if cfg_pp:
-            # Get the model output (v, the predicted velocity)
-            v, info = model(x, ts * t[i], return_info=True, **extra_args)
-
-            if "uncond_output" in info:
-                v_eps = info["uncond_output"]
-            else:
-                v_eps = v
-        else:
-            v = model(x, ts * t[i], **extra_args)
-            v_eps = v
+        # Get the model output (v, the predicted velocity)
+        with torch.amp.autocast(autocast_device_type):
+            v = model(x, ts * t[i], **extra_args).float()
 
         # Predict the noise and the denoised data
         pred = x * alphas[i] - v * sigmas[i]
@@ -332,12 +334,13 @@ def sample_k(
         model_fn,
         noise,
         init_data=None,
+        mask=None,
         steps=100,
         sampler_type="dpmpp-2m-sde",
-        sigma_min=0.01,
-        sigma_max=100,
+        sigma_min=0.5,
+        sigma_max=50,
         rho=1.0,
-        device="cuda",
+        device=device.type,
         callback=None,
         cond_fn=None,
         **extra_args
@@ -367,6 +370,7 @@ def sample_k(
             x = noise
 
 
+    with torch.amp.autocast(autocast_device_type):
         if sampler_type == "k-heun":
             return K.sampling.sample_heun(denoiser, x, sigmas, disable=False, callback=callback, extra_args=extra_args)
         elif sampler_type == "k-lms":
@@ -416,9 +420,8 @@ def sample_rf(
         noise,
         init_data=None,
         steps=100,
-        sampler_type="euler",
         sigma_max=1,
-        device="cuda",
+        device=device.type,
         callback=None,
         cond_fn=None,
         **extra_args
