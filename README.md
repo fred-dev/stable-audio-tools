@@ -1,4 +1,7 @@
 # stable-audio-tools
+
+> **About this fork:** Fork of [Stability-AI/stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools) used to train EAGLE, the Synthetic Ornithology model (2024-26). Adds a Gradio interface that handles int and float conditioning, job scripts for the NCI Gadi cluster, Horovod, MPS/CPU support and other training changes. Configs live in [stable-audio-conditioning-configs](https://github.com/fred-dev/stable-audio-conditioning-configs) and [gadi_training_configs](https://github.com/fred-dev/gadi_training_configs).
+
 Training and inference code for audio generation models
 
 # Install
