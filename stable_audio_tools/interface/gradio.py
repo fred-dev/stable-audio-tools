@@ -473,6 +473,11 @@ def create_ui(model_config_path=None, ckpt_path=None, pretrained_name=None, pret
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+
+    if device.type == "cpu" and model_half:
+        print("No GPU found, running in float32 instead of half precision")
+        model_half = False
+
     _, model_config = load_model(model_config, ckpt_path, pretrained_name=pretrained_name, pretransform_ckpt_path=pretransform_ckpt_path, model_half=model_half, lora_ckpt_paths=lora_ckpt_paths, device=device)
     
     if model_type == "diffusion_cond" and is_climate_model(model_config):
