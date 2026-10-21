@@ -23,6 +23,7 @@ dependencies = [
     "PyWavelets==1.4.1",
     "safetensors",
     "scipy",
+    "scipy<1.15; sys_platform == 'darwin'",  # 1.15.x macOS wheels fail to dlopen on macOS 27
     "sentencepiece==0.1.99",
     "soxr",
     "torch==2.7.1",
@@ -39,7 +40,7 @@ train = [
     "auraloss==0.4.0",
     "descript-audio-codec==1.0.0",
     "encodec==0.1.1",
-    "inf-cl",
+    "inf-cl; sys_platform == 'linux'",
     "laion-clap==1.1.4",
     "pandas==2.0.2",
     "prefigure==0.0.9",
