@@ -54,7 +54,7 @@ class DitheredFSQ(Module):
 
         self.scale = scale
 
-        half_l = self.scale * 2 / (self._levels - 1)
+        half_l = self.scale * 2 / (self._levels.float() - 1)
         self.register_buffer("half_l", half_l, persistent = False)
 
         self.allowed_dtypes = (torch.float32, torch.float64)
@@ -118,7 +118,7 @@ class DitheredFSQ(Module):
         # make sure allowed dtype before quantizing
 
         if z.dtype not in self.allowed_dtypes:
-            z = z.to(torch.float64)
+            z = z.float()
 
         codes = self.quantize(z, skip_tanh=skip_tanh)
         indices = self._codes_to_indices(codes)

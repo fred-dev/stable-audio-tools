@@ -1,25 +1,52 @@
 # stable-audio-tools
 
-> **About this fork:** Fork of [Stability-AI/stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools) used to train EAGLE, the Synthetic Ornithology model (2024-26). Adds a Gradio interface that handles int and float conditioning, job scripts for the NCI Gadi cluster, Horovod, MPS/CPU support and other training changes. Configs live in [stable-audio-conditioning-configs](https://github.com/fred-dev/stable-audio-conditioning-configs) and [gadi_training_configs](https://github.com/fred-dev/gadi_training_configs).
+> **About this fork:** Fork of [Stability-AI/stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools) used to train EAGLE, the Synthetic Ornithology model (2024-26). Tracks upstream 0.0.20 and adds a Gradio interface for numeric climate/location conditioning with bird presets ([climate_cond.py](stable_audio_tools/interface/interfaces/climate_cond.py), picked automatically for models with number-only conditioning), batch generation from weather JSON files ([run_tests.py](run_tests.py)), and MPS device selection. Configs live in [stable-audio-conditioning-configs](https://github.com/fred-dev/stable-audio-conditioning-configs) and [gadi_training_configs](https://github.com/fred-dev/gadi_training_configs).
+>
+> Setup on a new machine (Linux + CUDA 12.6, Apple Silicon, or Windows; Intel Macs are not supported by torch 2.7):
+>
+> ```bash
+> uv sync --extra all
+> uv run python scripts/eagle_smoke_test.py --model-config model_config.json --ckpt-path model.ckpt
+> uv run python run_gradio.py --model-config model_config.json --ckpt-path model.ckpt
+> ```
 
 Training and inference code for audio generation models
 
 # Install
 
-The library can be installed from PyPI with:
+Requires PyTorch 2.5 or later for Flash Attention and Flex Attention support. Development for the repo is done in Python 3.10.
+
+We use [uv](https://docs.astral.sh/uv/) for fast, reproducible dependency management. Install it with `pip install uv` or see the [uv docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+Clone the repo and install dependencies:
 ```bash
-$ pip install stable-audio-tools
+$ git clone https://github.com/Stability-AI/stable-audio-tools.git
+$ cd stable-audio-tools
+
+# Inference only
+$ uv sync
+
+# Training
+$ uv sync --extra train
+
+# Everything (training + Gradio UI)
+$ uv sync --extra train --extra ui
 ```
 
-To run the training scripts or inference code, you'll want to clone this repository, navigate to the root, and run:
+### Flash Attention
+
+[Flash Attention](https://github.com/Dao-AILab/flash-attention) is recommended for performance. Follow the installation instructions in the Flash Attention repository to install it after running `uv sync`.
+
+Run scripts with `uv run`:
 ```bash
-$ pip install .
+$ uv run python train.py --dataset-config /path/to/config ...
+$ uv run python run_gradio.py --pretrained-name stabilityai/stable-audio-open-1.0
 ```
 
-# Requirements
-Requires PyTorch 2.5 or later for Flash Attention and Flex Attention support
-
-Development for the repo is done in Python 3.10
+Alternatively, you can use pip directly:
+```bash
+$ pip install "stable-audio-tools[train]"
+```
 
 # Interface
 

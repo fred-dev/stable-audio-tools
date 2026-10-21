@@ -5,45 +5,83 @@ import logging, warnings
 import string
 import typing as tp
 import gc
+from enum import Enum
+import os
+
+
+class PaddingMode(str, Enum):
+    """Enum for handling padding in text conditioner embeddings."""
+    NONE = "none"       # No padding handling (raw embeddings with pad token)
+    ZERO = "zero"       # Zero out padding positions (default)
+    LEARNED = "learned" # Use learned padding embedding
 
 from .adp import NumberEmbedder
 from ..inference.utils import set_audio_channels
 from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
-from .utils import load_ckpt_state_dict
+from ..models.utils import copy_state_dict
+from .utils import load_ckpt_state_dict, enable_torch_compile
 from .transformer import AbsolutePositionalEmbedding
 
 from torch import nn
-
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif torch.backends.mps.is_available():
-    device = torch.device('mps')
-else:
-    device = torch.device('cpu')
-
-valid_autocast_device_types = {"cuda", "cpu"}
-autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
+from typing import Union, Dict, List, Tuple
+from torch.nn import functional as F
+import numpy as np
 
 class Conditioner(nn.Module):
     def __init__(
             self,
             dim: int,
             output_dim: int,
-            project_out: bool = False
+            project_out: bool = False,
+            padding_mode: str = "zero"
             ):
-        
+
         super().__init__()
 
         self.dim = dim
         self.output_dim = output_dim
+        self.padding_mode = padding_mode
         self.proj_out = nn.Linear(dim, output_dim) if (dim != output_dim or project_out) else nn.Identity()
+
+        # Learned padding embedding (only created if needed)
+        if padding_mode == "learned" or padding_mode == PaddingMode.LEARNED:
+            self.padding_embedding = nn.Parameter(torch.randn(output_dim) * 0.02)
+
+    def apply_padding(self, embeddings: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply padding handling based on padding_mode.
+
+        Args:
+            embeddings: [batch, seq_len, dim] - the embeddings to process
+            attention_mask: [batch, seq_len] bool/int, True/1 = valid token
+
+        Returns:
+            embeddings with padding handled according to mode
+        """
+        mode = self.padding_mode
+        if isinstance(mode, str):
+            mode = PaddingMode(mode)
+
+        if mode == PaddingMode.NONE:
+            return embeddings
+        elif mode == PaddingMode.ZERO:
+            return embeddings * attention_mask.unsqueeze(-1).float()
+        elif mode == PaddingMode.LEARNED:
+            mask_expanded = attention_mask.unsqueeze(-1).bool()
+            return torch.where(
+                mask_expanded,
+                embeddings,
+                self.padding_embedding.unsqueeze(0).unsqueeze(0).expand_as(embeddings)
+            )
+        else:
+            raise ValueError(f"Unknown padding mode: {mode}")
 
     def forward(self, x: tp.Any) -> tp.Any:
         raise NotImplementedError()
-    
+
 class IntConditioner(Conditioner):
-    def __init__(self, 
+    def __init__(self,
                 output_dim: int,
                 min_val: int=0,
                 max_val: int=512
@@ -55,41 +93,42 @@ class IntConditioner(Conditioner):
         self.int_embedder = nn.Embedding(max_val - min_val + 1, output_dim).requires_grad_(True)
 
     def forward(self, ints: tp.List[int], device=None) -> tp.Any:
-            
+
             #self.int_embedder.to(device)
-    
+
             ints = torch.tensor(ints).to(device)
             ints = ints.clamp(self.min_val, self.max_val)
-    
+
             int_embeds = self.int_embedder(ints).unsqueeze(1)
-    
+
             return [int_embeds, torch.ones(int_embeds.shape[0], 1).to(device)]
 
 class NumberConditioner(Conditioner):
     '''
         Conditioner that takes a list of floats, normalizes them for a given range, and returns a list of embeddings
     '''
-    def __init__(self, 
+    def __init__(self,
                 output_dim: int,
                 min_val: float=0,
-                max_val: float=1
+                max_val: float=1,
+                fourier_features_type : tp.Literal["learned", "expo"] = "learned"
                 ):
         super().__init__(output_dim, output_dim)
 
         self.min_val = min_val
         self.max_val = max_val
 
-        self.embedder = NumberEmbedder(features=output_dim)
+        self.embedder = NumberEmbedder(features=output_dim, fourier_features_type=fourier_features_type)
 
-    def forward(self, floats: tp.List[float], device=device) -> tp.Any:
-
+    def forward(self, floats: tp.List[float], device=None) -> tp.Any:
+            self.embedder.to(device)
             # Cast the inputs to floats
             floats = [float(x) for x in floats]
 
             floats = torch.tensor(floats).to(device)
 
             floats = floats.clamp(self.min_val, self.max_val)
-    
+
             normalized_floats = (floats - self.min_val) / (self.max_val - self.min_val)
 
             # Cast floats to same type as embedder
@@ -97,11 +136,11 @@ class NumberConditioner(Conditioner):
             normalized_floats = normalized_floats.to(embedder_dtype)
 
             float_embeds = self.embedder(normalized_floats).unsqueeze(1)
-    
+
             return [float_embeds, torch.ones(float_embeds.shape[0], 1).to(device)]
 
 class ListConditioner(Conditioner):
-    def __init__(self, 
+    def __init__(self,
                 output_dim: int,
                 options: tp.List[str]
                 ):
@@ -111,7 +150,7 @@ class ListConditioner(Conditioner):
         self.embedder = nn.Embedding(len(options)+1, output_dim).requires_grad_(True)
 
     def forward(self, texts: tp.List[str], device=None) -> tp.Any:
-
+        self.embedder.to(device)
         # Cast the inputs to floats, handling the case where the input is not in the options
         ints = [self.options.index(x) + 1 if x in self.options else 0 for x in texts]
 
@@ -120,6 +159,95 @@ class ListConditioner(Conditioner):
         int_embeds = self.embedder(ints).unsqueeze(1) # shape [batch_size, 1, output_dim]
 
         return [int_embeds, torch.ones(int_embeds.shape[0], 1).to(device)]
+
+class SATCLAPTextConditioner(Conditioner):
+    def __init__(self,
+                clap_model,
+                output_dim: int,
+                project_out: bool = False,
+                use_text_features = False,
+                feature_layer_ix: int = -2,
+                **kwargs):
+
+        super().__init__(clap_model.text_branch.embed_dim, output_dim, project_out=project_out)
+
+        self.model = clap_model
+        self.use_text_features = use_text_features
+        self.feature_layer_ix = feature_layer_ix
+
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+        del self.model.pretransform
+        del self.model.audio_branch
+
+    def forward(self, texts: tp.List[str], device: tp.Any = "cuda") -> tp.Any:
+        self.model.to(device)
+
+        if self.use_text_features:
+            if len(texts) == 1:
+                text_features, text_attention_mask = self.model.text_branch.get_text_features([texts[0], ""], layer_ix=self.feature_layer_ix)
+                text_features = text_features[:1, ...]
+                text_attention_mask = text_attention_mask[:1, ...]
+            else:
+                text_features, text_attention_mask = self.model.text_branch.get_text_features(texts, layer_ix=self.feature_layer_ix)
+
+            # Cast text feature to same type as proj_out, unless proj_out is Identity
+            if not isinstance(self.proj_out, nn.Identity):
+                proj_out_dtype = next(self.proj_out.parameters()).dtype
+                text_features = text_features.to(proj_out_dtype)
+
+            return [self.proj_out(text_features), text_attention_mask]
+
+        # Fix for CLAP bug when only one text is passed
+        if len(texts) == 1:
+            text_embedding = self.model.get_text_embedding([texts[0], ""])[:1, ...]
+        else:
+            text_embedding = self.model.get_text_embedding(texts)
+
+        text_embedding = text_embedding.unsqueeze(1).to(device)
+
+        # Cast text embedding to same type as proj_out, unless proj_out is Identity
+        if not isinstance(self.proj_out, nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            text_embedding = text_embedding.to(proj_out_dtype)
+
+        return [self.proj_out(text_embedding), torch.ones(text_embedding.shape[0], 1).to(device)]
+
+class SATCLAPAudioConditioner(Conditioner):
+    def __init__(self,
+                clap_model,
+                output_dim: int,
+                project_out: bool = False,
+                **kwargs):
+
+        super().__init__(clap_model.joint_embed_dim, output_dim, project_out=project_out)
+
+        self.model = clap_model
+
+        self.model.requires_grad_(False)
+        self.model.eval()
+
+        del self.model.text_branch
+
+    def forward(self, latents: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]], device: tp.Any = "cuda") -> tp.Any:
+        self.model.to(device)
+
+        if isinstance(latents, list) or isinstance(latents, tuple):
+            latents = torch.stack(latents, dim=0)
+
+        latents = latents.to(device)
+
+        audio_embedding = self.model.get_audio_embedding(latents)
+
+        # Cast text embedding to same type as proj_out, unless proj_out is Identity
+        if not isinstance(self.proj_out, nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            audio_embedding = audio_embedding.to(proj_out_dtype)
+
+        audio_embedding = audio_embedding.unsqueeze(1).to(device)
+
+        return [self.proj_out(audio_embedding), torch.ones(audio_embedding.shape[0], 1).to(device)]
 
 def clap_load_state_dict(clap_ckpt_path, clap_model):
     state_dict = torch.load(clap_ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
@@ -133,19 +261,20 @@ def clap_load_state_dict(clap_ckpt_path, clap_model):
         if removed_key in state_dict:
             del state_dict[removed_key]
 
-    clap_model.load_state_dict(state_dict, strict=False)
+    clap_model.load_state_dict(state_dict)
 
 class CLAPTextConditioner(Conditioner):
-    def __init__(self, 
-                 output_dim: int, 
+    def __init__(self,
+                 output_dim: int,
                  clap_ckpt_path,
                  use_text_features = False,
                  feature_layer_ix: int = -1,
-                 audio_model_type="HTSAT-base", 
+                 audio_model_type="HTSAT-base",
                  enable_fusion=True,
                  project_out: bool = False,
-                 finetune: bool = False):
-        super().__init__(768 if use_text_features else 512, output_dim, project_out=project_out)
+                 finetune: bool = False,
+                 padding_mode: str = "none"):
+        super().__init__(768 if use_text_features else 512, output_dim, project_out=project_out, padding_mode=padding_mode)
 
         self.use_text_features = use_text_features
         self.feature_layer_ix = feature_layer_ix
@@ -158,12 +287,12 @@ class CLAPTextConditioner(Conditioner):
             warnings.simplefilter("ignore")
             try:
                 import laion_clap
-                
+
                 model = laion_clap.CLAP_Module(enable_fusion=enable_fusion, amodel=audio_model_type, device='cpu')
 
                 if self.finetune:
                     self.model = model
-                else: 
+                else:
                     self.__dict__["model"] = model
 
                 clap_load_state_dict(clap_ckpt_path, self.model.model)
@@ -181,10 +310,9 @@ class CLAPTextConditioner(Conditioner):
         del self.model.model.audio_branch
 
         gc.collect()
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-    def get_clap_features(self, prompts, layer_ix=-2, device: tp.Any = device):
+    def get_clap_features(self, prompts, layer_ix=-2, device: tp.Any = "cuda"):
         prompt_tokens = self.model.tokenizer(prompts)
         attention_mask = prompt_tokens["attention_mask"].to(device=device, non_blocking=True)
         prompt_features = self.model.model.text_branch(
@@ -195,7 +323,7 @@ class CLAPTextConditioner(Conditioner):
 
         return prompt_features, attention_mask
 
-    def forward(self, texts: tp.List[str], device: tp.Any = device) -> tp.Any:
+    def forward(self, texts: tp.List[str], device: tp.Any = "cuda") -> tp.Any:
         self.model.to(device)
 
         if self.use_text_features:
@@ -209,9 +337,12 @@ class CLAPTextConditioner(Conditioner):
             # Cast text feature to same type as proj_out, unless proj_out is Identity
             if not isinstance(self.proj_out, nn.Identity):
                 proj_out_dtype = next(self.proj_out.parameters()).dtype
-                text_features = text_features.to(proj_out_dtype)                        
+                text_features = text_features.to(proj_out_dtype)
 
-            return [self.proj_out(text_features), text_attention_mask]
+            text_features = self.proj_out(text_features)
+            text_features = self.apply_padding(text_features, text_attention_mask)
+
+            return [text_features, text_attention_mask]
 
         # Fix for CLAP bug when only one text is passed
         if len(texts) == 1:
@@ -229,13 +360,15 @@ class CLAPTextConditioner(Conditioner):
         return [self.proj_out(text_embedding), torch.ones(text_embedding.shape[0], 1).to(device)]
 
 class CLAPAudioConditioner(Conditioner):
-    def __init__(self, 
-                 output_dim: int, 
+    def __init__(self,
+                 output_dim: int,
                  clap_ckpt_path,
-                 audio_model_type="HTSAT-base", 
+                 audio_model_type="HTSAT-base",
                  enable_fusion=True,
                  project_out: bool = False):
         super().__init__(512, output_dim, project_out=project_out)
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Suppress logging from transformers
         previous_level = logging.root.manager.disable
@@ -244,13 +377,12 @@ class CLAPAudioConditioner(Conditioner):
             warnings.simplefilter("ignore")
             try:
                 import laion_clap
-                from laion_clap.clap_module.factory import load_state_dict as clap_load_state_dict
 
-                model = laion_clap.CLAP_Module(enable_fusion=enable_fusion, amodel=audio_model_type, device=device)
+                model = laion_clap.CLAP_Module(enable_fusion=enable_fusion, amodel=audio_model_type, device='cpu')
 
                 if self.finetune:
                     self.model = model
-                else: 
+                else:
                     self.__dict__["model"] = model
 
                 clap_load_state_dict(clap_ckpt_path, self.model.model)
@@ -268,10 +400,9 @@ class CLAPAudioConditioner(Conditioner):
         del self.model.model.text_branch
 
         gc.collect()
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-    def forward(self, audios: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]] , device: tp.Any = device) -> tp.Any:
+    def forward(self, audios: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]] , device: tp.Any = "cuda") -> tp.Any:
 
         self.model.to(device)
 
@@ -281,7 +412,7 @@ class CLAPAudioConditioner(Conditioner):
         # Convert to mono
         mono_audios = audios.mean(dim=1)
 
-        with torch.amp.autocast(autocast_device_type, enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             audio_embedding = self.model.get_audio_embedding_from_data(mono_audios.float(), use_tensor=True)
 
         audio_embedding = audio_embedding.unsqueeze(1).to(device)
@@ -299,7 +430,7 @@ class T5Conditioner(Conditioner):
     T5_MODELS = ["t5-small", "t5-base", "t5-large", "t5-3b", "t5-11b",
               "google/flan-t5-small", "google/flan-t5-base", "google/flan-t5-large",
               "google/flan-t5-xl", "google/flan-t5-xxl", "google/t5-v1_1-xl", "google/t5-v1_1-xxl"]
-    
+
     T5_MODEL_DIMS = {
         "t5-small": 512,
         "t5-base": 768,
@@ -323,37 +454,279 @@ class T5Conditioner(Conditioner):
             t5_model_name: str = "t5-base",
             max_length: str = 128,
             enable_grad: bool = False,
-            project_out: bool = False
+            project_out: bool = False,
+            padding_mode: str = "zero",
+            model_path: str = None,
     ):
         assert t5_model_name in self.T5_MODELS, f"Unknown T5 model name: {t5_model_name}"
-        super().__init__(self.T5_MODEL_DIMS[t5_model_name], output_dim, project_out=project_out)
-        
-        from transformers import T5EncoderModel, AutoTokenizer
+        super().__init__(self.T5_MODEL_DIMS[t5_model_name], output_dim, project_out=project_out, padding_mode=padding_mode)
+
+        load_from = model_path or t5_model_name
 
         self.max_length = max_length
         self.enable_grad = enable_grad
 
+        # Set environment variables to disable progress bars BEFORE importing transformers
+        prev_hf_hub = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+        prev_transformers = os.environ.get("TRANSFORMERS_VERBOSITY")
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
         # Suppress logging from transformers
         previous_level = logging.root.manager.disable
         logging.disable(logging.ERROR)
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                # self.tokenizer = T5Tokenizer.from_pretrained(t5_model_name, model_max_length = max_length)
-                # model = T5EncoderModel.from_pretrained(t5_model_name, max_length=max_length).train(enable_grad).requires_grad_(enable_grad)
-                self.tokenizer = AutoTokenizer.from_pretrained(t5_model_name)
-                model = T5EncoderModel.from_pretrained(t5_model_name).train(enable_grad).requires_grad_(enable_grad).to(torch.float16)
+                from transformers import T5EncoderModel, AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(load_from)
+                model = T5EncoderModel.from_pretrained(load_from).train(enable_grad).requires_grad_(enable_grad).to(torch.float16)
+
             finally:
                 logging.disable(previous_level)
-            
+                # Restore environment variables
+                if prev_hf_hub is None:
+                    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+                else:
+                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_hf_hub
+                if prev_transformers is None:
+                    os.environ.pop("TRANSFORMERS_VERBOSITY", None)
+                else:
+                    os.environ["TRANSFORMERS_VERBOSITY"] = prev_transformers
+
         if self.enable_grad:
             self.model = model
-        else: 
+        else:
             self.__dict__["model"] = model
 
 
     def forward(self, texts: tp.List[str], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
-        
+
+        self.model.to(device)
+        self.proj_out.to(device)
+
+        if isinstance(texts[0], dict):
+            # Pre-tokenized input (e.g. from DataLoader with tokenizers)
+            input_ids = torch.stack([x["input_ids"] for x in texts]).to(device, non_blocking=True)
+            attention_mask = torch.stack([x["attention_mask"] for x in texts]).to(device, non_blocking=True).to(torch.bool)
+        else:
+            encoded = self.tokenizer(
+                texts,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device).to(torch.bool)
+
+        self.model.eval()
+
+        with torch.amp.autocast('cuda', dtype=torch.float16) and torch.set_grad_enabled(self.enable_grad):
+            embeddings = self.model(
+                input_ids=input_ids, attention_mask=attention_mask
+            )["last_hidden_state"]
+
+        # Cast embeddings to same type as proj_out, unless proj_out is Identity
+        if not isinstance(self.proj_out, nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            embeddings = embeddings.to(proj_out_dtype)
+
+        embeddings = self.proj_out(embeddings)
+        embeddings = self.apply_padding(embeddings, attention_mask)
+
+        return embeddings, attention_mask
+
+class T5GemmaConditioner(Conditioner):
+
+    T5GEMMA_MODELS = ["google/t5gemma-b-b-ul2"]
+
+    T5GEMMA_MODEL_DIMS = {
+        "google/t5gemma-b-b-ul2": 768,
+    }
+
+    def __init__(
+            self,
+            output_dim: int,
+            model_name: str = "google/t5gemma-b-b-ul2",
+            max_length: str = 128,
+            enable_grad: bool = False,
+            project_out: bool = False,
+            padding_mode: str = "zero",
+            model_path: str = None,
+            repo_id: str = None,
+            subfolder: str = None,
+    ):
+        assert model_name in self.T5GEMMA_MODELS, f"Unknown T5 model name: {model_name}"
+        super().__init__(self.T5GEMMA_MODEL_DIMS[model_name], output_dim, project_out=project_out, padding_mode=padding_mode)
+
+        load_from = model_path or repo_id or model_name
+
+        self.max_length = max_length
+        self.enable_grad = enable_grad
+
+        # Set environment variables to disable progress bars BEFORE importing transformers
+        # This is the most reliable way to suppress HuggingFace progress bars
+        prev_hf_hub = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+        prev_transformers = os.environ.get("TRANSFORMERS_VERBOSITY")
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+        # Suppress logging from transformers
+        previous_level = logging.root.manager.disable
+        logging.disable(logging.ERROR)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                from transformers import T5GemmaEncoderModel, AutoTokenizer, AutoConfig
+                logging.info(f"Loading T5Gemma tokenizer and model from: {load_from}")
+                hf_kwargs = {"subfolder": subfolder} if subfolder else {}
+                self.tokenizer = AutoTokenizer.from_pretrained(load_from, **hf_kwargs)
+                config = AutoConfig.from_pretrained(load_from, **hf_kwargs)
+                config.is_encoder_decoder = False
+                model = T5GemmaEncoderModel.from_pretrained(load_from, config=config, **hf_kwargs).train(enable_grad).requires_grad_(enable_grad)
+
+            finally:
+                logging.disable(previous_level)
+                # Restore environment variables
+                if prev_hf_hub is None:
+                    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+                else:
+                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_hf_hub
+                if prev_transformers is None:
+                    os.environ.pop("TRANSFORMERS_VERBOSITY", None)
+                else:
+                    os.environ["TRANSFORMERS_VERBOSITY"] = prev_transformers
+
+        # Compile the model to reduce CPU-GPU kernel launch overhead,
+        # which is sensitive to CPU contention from DataLoader workers
+        if enable_torch_compile:
+            model = torch.compile(model)
+
+        if self.enable_grad:
+            self.model = model
+        else:
+            self.__dict__["model"] = model
+
+        self._device_initialized = False
+
+    def forward(self, inputs: tp.Union[tp.List[str], tp.List[tp.Dict[str, torch.Tensor]]], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+
+        # Only move to device once (avoid overhead on every forward call)
+        if not self._device_initialized:
+            self.model.to(device)
+            self.proj_out.to(device)
+            self.model.eval()
+            self._device_initialized = True
+
+        # Handle pre-tokenized inputs (dicts with input_ids/attention_mask from DataLoader workers)
+        # or raw strings (from demo generation / inference)
+        if isinstance(inputs[0], dict):
+            input_ids = torch.stack([x["input_ids"] for x in inputs]).to(device, non_blocking=True)
+            attention_mask = torch.stack([x["attention_mask"] for x in inputs]).to(device, non_blocking=True).to(torch.bool)
+        else:
+            encoded = self.tokenizer(
+                inputs,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(device, non_blocking=True)
+            attention_mask = encoded["attention_mask"].to(device, non_blocking=True).to(torch.bool)
+
+        with torch.no_grad():
+            embeddings = self.model(
+                input_ids=input_ids, attention_mask=attention_mask
+            )["last_hidden_state"]
+
+        # Cast embeddings to same type as proj_out, unless proj_out is Identity
+        if not isinstance(self.proj_out, nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            embeddings = embeddings.to(proj_out_dtype)
+
+        embeddings = self.proj_out(embeddings)
+        embeddings = self.apply_padding(embeddings, attention_mask)
+
+        return embeddings, attention_mask
+
+class CausalLMConditioner(Conditioner):
+
+    MODELS = ["google/gemma-2-2b"]
+
+    MODEL_DIMS = {
+        "google/gemma-2-2b": 2304
+    }
+
+    def __init__(
+            self,
+            output_dim: int,
+            model_name: str = "google/gemma-2-2b",
+            max_length: str = 128,
+            enable_grad: bool = False,
+            project_out: bool = False,
+            learned_scale: bool = True,
+            padding_mode: str = "zero",
+            model_path: str = None,
+    ):
+        assert model_name in self.MODELS, f"Unknown model name: {model_name}"
+        super().__init__(self.MODEL_DIMS[model_name], output_dim, project_out=project_out, padding_mode=padding_mode)
+
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        from .blocks import RMSNorm
+
+        load_from = model_path or model_name
+
+        self.max_length = max_length
+        self.enable_grad = enable_grad
+
+        # Set environment variables to disable progress bars BEFORE importing transformers
+        prev_hf_hub = os.environ.get("HF_HUB_DISABLE_PROGRESS_BARS")
+        prev_transformers = os.environ.get("TRANSFORMERS_VERBOSITY")
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
+        # Suppress logging from transformers
+        previous_level = logging.root.manager.disable
+        logging.disable(logging.ERROR)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                from transformers import AutoTokenizer, AutoModelForCausalLM
+                self.tokenizer = AutoTokenizer.from_pretrained(load_from)
+                model = AutoModelForCausalLM.from_pretrained(load_from).train(enable_grad).requires_grad_(enable_grad)
+
+            finally:
+                logging.disable(previous_level)
+                # Restore environment variables
+                if prev_hf_hub is None:
+                    os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
+                else:
+                    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = prev_hf_hub
+                if prev_transformers is None:
+                    os.environ.pop("TRANSFORMERS_VERBOSITY", None)
+                else:
+                    os.environ["TRANSFORMERS_VERBOSITY"] = prev_transformers
+
+        if self.enable_grad:
+            self.model = model
+        else:
+            self.__dict__["model"] = model
+
+        self.norm = RMSNorm(self.dim)
+
+        self.learned_scale = learned_scale
+
+        if self.learned_scale:
+            self.scale = nn.Parameter(torch.tensor(.01))
+
+
+    def forward(self, texts: tp.List[str], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+
         self.model.to(device)
         self.proj_out.to(device)
 
@@ -370,17 +743,26 @@ class T5Conditioner(Conditioner):
 
         self.model.eval()
 
-        with torch.amp.autocast(autocast_device_type, dtype=torch.float16) and torch.set_grad_enabled(self.enable_grad):
+        with torch.set_grad_enabled(self.enable_grad):
             embeddings = self.model(
-                input_ids=input_ids, attention_mask=attention_mask
-            )["last_hidden_state"]
+                input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, use_cache=False
+            )["hidden_states"][-1]
 
-        embeddings = self.proj_out(embeddings.float())
+        # Cast embeddings to same type as proj_out, unless proj_out is Identity
+        if not isinstance(self.proj_out, nn.Identity):
+            proj_out_dtype = next(self.proj_out.parameters()).dtype
+            embeddings = embeddings.to(proj_out_dtype)
 
-        embeddings = embeddings * attention_mask.unsqueeze(-1).float()
+        embeddings = self.norm(embeddings)
+
+        if self.learned_scale:
+            embeddings = embeddings * self.scale
+
+        embeddings = self.proj_out(embeddings)
+        embeddings = self.apply_padding(embeddings, attention_mask)
 
         return embeddings, attention_mask
-    
+
 class PhonemeConditioner(Conditioner):
     """
     A conditioner that turns text into phonemes and embeds them using a lookup table
@@ -399,7 +781,7 @@ class PhonemeConditioner(Conditioner):
             project_out: bool = False,
     ):
         super().__init__(output_dim, output_dim, project_out=project_out)
-        
+
         from g2p_en import G2p
 
         self.max_length = max_length
@@ -410,12 +792,12 @@ class PhonemeConditioner(Conditioner):
         self.phoneme_embedder = nn.Embedding(len(self.g2p.phonemes) + 2, output_dim)
 
     def forward(self, texts: tp.List[str], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
-        
+
         self.phoneme_embedder.to(device)
         self.proj_out.to(device)
 
         batch_phonemes = [self.g2p(text) for text in texts] # shape [batch_size, length]
-        
+
         phoneme_ignore = [" ", *string.punctuation]
 
         # Remove ignored phonemes and cut to max length
@@ -427,16 +809,16 @@ class PhonemeConditioner(Conditioner):
         #Pad to match longest and make a mask tensor for the padding
         longest = max([len(ids) for ids in phoneme_ids])
         phoneme_ids = [ids + [0] * (longest - len(ids)) for ids in phoneme_ids]
-        
+
         phoneme_ids = torch.tensor(phoneme_ids).to(device)
 
         # Convert to embeddings
         phoneme_embeds = self.phoneme_embedder(phoneme_ids)
-        
+
         phoneme_embeds = self.proj_out(phoneme_embeds)
 
         return phoneme_embeds, torch.ones(phoneme_embeds.shape[0], phoneme_embeds.shape[1]).to(device)
-  
+
 class TokenizerLUTConditioner(Conditioner):
     """
     A conditioner that embeds text using a lookup table on a pretrained tokenizer's vocabulary
@@ -455,21 +837,55 @@ class TokenizerLUTConditioner(Conditioner):
             max_length: int = 1024,
             use_abs_pos_emb = False,
             project_out: bool = False,
-            special_tokens: tp.List[str] = []
+            special_tokens: tp.List[str] = [],
+            model_path: str = None,
     ):
         super().__init__(output_dim, output_dim, project_out=project_out)
-        
+
         from transformers import AutoTokenizer
 
-         # Suppress logging from transformers
+        load_from = model_path or tokenizer_name
+
+        # Suppress logging from transformers
         previous_level = logging.root.manager.disable
         logging.disable(logging.ERROR)
+
+        # Also suppress transformers-specific logging and progress bars
+        transformers_log_level = None
+        transformers_disable_progress_bar = None
+        try:
+            import transformers
+            transformers_log_level = transformers.logging.get_verbosity()
+            transformers.logging.set_verbosity_error()
+            # Disable progress bars
+            try:
+                from transformers.utils import is_progress_bar_enabled
+                transformers_disable_progress_bar = not is_progress_bar_enabled()
+                transformers.utils.logging.disable_progress_bar()
+            except (ImportError, AttributeError) as e:
+                # Progress bar control not available in this transformers version
+                logging.debug(f"Could not disable transformers progress bar: {e}")
+        except (ImportError, AttributeError) as e:
+            # Transformers not available or version mismatch
+            logging.debug(f"Could not configure transformers logging: {e}")
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+                self.tokenizer = AutoTokenizer.from_pretrained(load_from)
+
             finally:
                 logging.disable(previous_level)
+                if transformers_log_level is not None:
+                    try:
+                        transformers.logging.set_verbosity(transformers_log_level)
+                    except (AttributeError, Exception) as e:
+                        logging.debug(f"Could not restore transformers log level: {e}")
+                if transformers_disable_progress_bar is not None and not transformers_disable_progress_bar:
+                    try:
+                        transformers.utils.logging.enable_progress_bar()
+                    except (AttributeError, Exception) as e:
+                        logging.debug(f"Could not re-enable transformers progress bar: {e}")
 
         # Add special tokens
         if len(special_tokens) > 0:
@@ -484,22 +900,27 @@ class TokenizerLUTConditioner(Conditioner):
         if use_abs_pos_emb:
             self.abs_pos_emb = AbsolutePositionalEmbedding(output_dim, max_length)
 
-    def forward(self, texts: tp.List[str], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, inputs: tp.Union[tp.List[str], tp.List[tp.Dict[str, torch.Tensor]]], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
         self.proj_out.to(device)
 
-        encoded = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
+        # Handle pre-tokenized inputs (dicts with input_ids/attention_mask from DataLoader workers)
+        # or raw strings (from demo generation / inference)
+        if isinstance(inputs[0], dict):
+            input_ids = torch.stack([x["input_ids"] for x in inputs]).to(device, non_blocking=True)
+            attention_mask = torch.stack([x["attention_mask"] for x in inputs]).to(device, non_blocking=True).to(torch.bool)
+        else:
+            encoded = self.tokenizer(
+                inputs,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(device, non_blocking=True)
+            attention_mask = encoded["attention_mask"].to(device, non_blocking=True).to(torch.bool)
 
-        input_ids = encoded["input_ids"].to(device)
-        attention_mask = encoded["attention_mask"].to(device).to(torch.bool)
-    
         embeddings = self.token_embedder(input_ids)
-            
+
         embeddings = self.proj_out(embeddings)
 
         embeddings = embeddings * attention_mask.unsqueeze(-1).float()
@@ -525,7 +946,7 @@ class PretransformConditioner(Conditioner):
             self.__dict__["pretransform"] = pretransform
         else:
             self.pretransform = pretransform
-        
+
 
     def forward(self, audio: tp.Union[torch.Tensor, tp.List[torch.Tensor], tp.Tuple[torch.Tensor]], device: tp.Union[torch.device, str]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
 
@@ -543,7 +964,7 @@ class PretransformConditioner(Conditioner):
         audio = set_audio_channels(audio, self.pretransform.io_channels)
 
         audio = audio.to(device)
-        
+
         latents = self.pretransform.encode(audio)
 
         latents = self.proj_out(latents)
@@ -561,12 +982,12 @@ class SourceMixConditioner(Conditioner):
 
     """
     def __init__(
-        self, 
-        pretransform: Pretransform, 
-        output_dim: int, 
-        save_pretransform: bool = False, 
-        source_keys: tp.List[str] = [], 
-        pre_encoded: bool = False, 
+        self,
+        pretransform: Pretransform,
+        output_dim: int,
+        save_pretransform: bool = False,
+        source_keys: tp.List[str] = [],
+        pre_encoded: bool = False,
         allow_null_source=False,
         source_length=None
     ):
@@ -579,7 +1000,7 @@ class SourceMixConditioner(Conditioner):
 
         self.source_keys = source_keys
 
-        self.source_heads = nn.ModuleList([nn.Conv1d(pretransform.encoded_channels, output_dim, kernel_size=1) for _ in source_keys])        
+        self.source_heads = nn.ModuleList([nn.Conv1d(pretransform.encoded_channels, output_dim, kernel_size=1) for _ in source_keys])
 
         self.pre_encoded = pre_encoded
 
@@ -620,7 +1041,7 @@ class SourceMixConditioner(Conditioner):
                         audio = audio.to(device)
                         latents = self.pretransform.encode(audio).squeeze(0)
                     else:
-                        latents = source.to(device)           
+                        latents = source.to(device)
 
                     latents = latents.to(dtype)
 
@@ -628,7 +1049,7 @@ class SourceMixConditioner(Conditioner):
                         mix = self.source_heads[key_ix](latents)
                     else:
                         mix += self.source_heads[key_ix](latents)
-            
+
             if mix is not None:
                 mixes.append(mix)
             else:
@@ -674,9 +1095,9 @@ class MultiConditioner(nn.Module):
                         raise ValueError(f"Conditioner key {condition_key} not found in batch metadata")
 
                 #Unwrap the condition info if it's a single-element list or tuple, this is to support collation functions that wrap everything in a list
-                if (isinstance(x[condition_key], list) or isinstance(x[condition_key], tuple)) and len(x[condition_key]) == 1:
+                if isinstance(x[condition_key], list) or isinstance(x[condition_key], tuple) and len(x[condition_key]) == 1:
                     conditioner_input = x[condition_key][0]
-                    
+
                 else:
                     conditioner_input = x[condition_key]
 
@@ -688,7 +1109,7 @@ class MultiConditioner(nn.Module):
                 output[key] = conditioner(conditioner_inputs, device)
 
         return output
-    
+
 def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.Any], pretransform=None) -> MultiConditioner:
     """
     Create a MultiConditioner from a conditioning config dictionary
@@ -699,7 +1120,7 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
     """
     conditioners = {}
     cond_dim = config["cond_dim"]
-    
+
     default_keys = config.get("default_keys", {})
 
     pre_encoded_keys = config.get("pre_encoded_keys", [])
@@ -710,11 +1131,15 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
         conditioner_type = conditioner_info["type"]
 
         conditioner_config = {"output_dim": cond_dim}
-        
+
         conditioner_config.update(conditioner_info["config"])
 
         if conditioner_type == "t5":
             conditioners[id] = T5Conditioner(**conditioner_config)
+        elif conditioner_type == "t5gemma":
+            conditioners[id] = T5GemmaConditioner(**conditioner_config)
+        elif conditioner_type == "causal_lm":
+            conditioners[id] = CausalLMConditioner(**conditioner_config)
         elif conditioner_type == "clap_text":
             conditioners[id] = CLAPTextConditioner(**conditioner_config)
         elif conditioner_type == "clap_audio":
@@ -729,6 +1154,45 @@ def create_multi_conditioner_from_conditioning_config(config: tp.Dict[str, tp.An
             conditioners[id] = PhonemeConditioner(**conditioner_config)
         elif conditioner_type == "lut":
             conditioners[id] = TokenizerLUTConditioner(**conditioner_config)
+        elif conditioner_type == "sat_clap_text":
+            from .clap import create_clap_from_config
+
+            use_model_pretransform = conditioner_config.pop("use_model_pretransform", False)
+
+            clap_model = create_clap_from_config(conditioner_config, pretransform=pretransform if use_model_pretransform else None)
+
+            clap_ckpt_path = conditioner_config.get("ckpt_path", None)
+
+            if clap_ckpt_path is not None:
+                copy_state_dict(clap_model, load_ckpt_state_dict(clap_ckpt_path))
+
+                # Ensure that loading the checkpoint doesn't overwrite the model's pretransform
+                if use_model_pretransform:
+                    clap_model.pretransform = pretransform
+
+            conditioners[id] = SATCLAPTextConditioner(clap_model, **conditioner_config)
+
+        elif conditioner_type == "sat_clap_audio":
+            from .clap import create_clap_from_config
+
+            sample_rate = conditioner_config.get("sample_rate", None)
+            assert sample_rate is not None, "Sample rate must be specified for SAT-CLAP conditioners"
+
+            use_model_pretransform = conditioner_config.pop("use_model_pretransform", False)
+
+            clap_model = create_clap_from_config(conditioner_config, pretransform=pretransform if use_model_pretransform else None)
+
+            clap_ckpt_path = conditioner_config.get("ckpt_path", None)
+
+            if clap_ckpt_path is not None:
+                copy_state_dict(clap_model, load_ckpt_state_dict(clap_ckpt_path))
+
+                # Ensure that loading the checkpoint doesn't overwrite the model's pretransform
+                if use_model_pretransform:
+                    clap_model.pretransform = pretransform
+
+            conditioners[id] = SATCLAPAudioConditioner(clap_model, **conditioner_config)
+
         elif conditioner_type == "pretransform":
             sample_rate = conditioner_config.pop("sample_rate", None)
             assert sample_rate is not None, "Sample rate must be specified for pretransform conditioners"

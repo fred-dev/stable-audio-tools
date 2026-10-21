@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from functools import partial
+from functools import partial, reduce
 import numpy as np
 import typing as tp
 import random
@@ -13,7 +13,7 @@ from .factory import create_pretransform_from_config
 from .pretransforms import Pretransform
 from .transformer import ContinuousTransformer
 from ..inference.generation import generate_diffusion_cond
-from ..inference.sampling import DistributionShift
+from ..inference.sampling import FluxDistributionShift, DistributionShift, LogSNRShift, IdentityDistributionShift
 
 from time import time
 
@@ -87,6 +87,7 @@ class ConditionedDiffusionModel(nn.Module):
                 cross_attn_cond: torch.Tensor = None,
                 cross_attn_mask: torch.Tensor = None,
                 input_concat_cond: torch.Tensor = None,
+                local_add_cond: torch.Tensor = None,
                 global_embed: torch.Tensor = None,
                 prepend_cond: torch.Tensor = None,
                 prepend_cond_mask: torch.Tensor = None,
@@ -110,10 +111,15 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             min_input_length: int,
             diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
             distribution_shift_options = None,
+            sampling_distribution_shift_options = None,
+            mask_padding_attention: bool = False,
+            use_effective_length_for_schedule: bool = False,
             pretransform: tp.Optional[Pretransform] = None,
             cross_attn_cond_ids: tp.List[str] = [],
             global_cond_ids: tp.List[str] = [],
             input_concat_ids: tp.List[str] = [],
+            local_add_cond_ids: tp.List[str] = [],
+            modular_local_cond_ids: tp.List[str] = [],
             prepend_cond_ids: tp.List[str] = [],
             ):
         super().__init__()
@@ -127,12 +133,39 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         self.cross_attn_cond_ids = cross_attn_cond_ids
         self.global_cond_ids = global_cond_ids
         self.input_concat_ids = input_concat_ids
+        self.local_add_cond_ids = local_add_cond_ids
+        self.modular_local_cond_ids = modular_local_cond_ids
         self.prepend_cond_ids = prepend_cond_ids
         self.min_input_length = min_input_length
+        self.mask_padding_attention = mask_padding_attention
+        self.use_effective_length_for_schedule = use_effective_length_for_schedule
 
         self.dist_shift = None
         if distribution_shift_options is not None:
-            self.dist_shift = DistributionShift(**distribution_shift_options)     
+            self.dist_shift = self._create_dist_shift(distribution_shift_options)
+
+        # Sampling dist_shift: separate config for inference-time schedule
+        if sampling_distribution_shift_options is not None:
+            self.sampling_dist_shift = self._create_dist_shift(sampling_distribution_shift_options)
+        else:
+            # Default: seq_len-invariant LogSNR shift matching legacy log_snr_sampling=True
+            self.sampling_dist_shift = LogSNRShift(rate=0, anchor_logsnr=-6.2, logsnr_end=2.0)
+
+    @staticmethod
+    def _create_dist_shift(options: dict):
+        """Create a distribution shift object from config options."""
+        dist_shift_type = options.get("type", "full")
+        dist_shift_kwargs = {k: v for k, v in options.items() if k != "type"}
+        if dist_shift_type == "none":
+            return IdentityDistributionShift()
+        elif dist_shift_type == "flux":
+            return FluxDistributionShift(**dist_shift_kwargs)
+        elif dist_shift_type == "full":
+            return DistributionShift(**dist_shift_kwargs)
+        elif dist_shift_type == "logsnr":
+            return LogSNRShift(**dist_shift_kwargs)
+        else:
+            raise ValueError(f"Unknown distribution shift type: {dist_shift_type}. Expected 'none', 'flux', 'full', or 'logsnr'.")     
 
     def get_conditioning_inputs(self, conditioning_tensors: tp.Dict[str, tp.Any], negative=False):
         cross_attention_input = None
@@ -141,6 +174,8 @@ class ConditionedDiffusionModelWrapper(nn.Module):
         input_concat_cond = None
         prepend_cond = None
         prepend_cond_mask = None
+        local_add_cond = None
+        modular_local_cond = None
 
         if len(self.cross_attn_cond_ids) > 0:
             # Concatenate all cross-attention inputs over the sequence dimension
@@ -182,6 +217,22 @@ class ConditionedDiffusionModelWrapper(nn.Module):
             # Assumes that the input concat conditioning inputs are of shape (batch, channels, seq)
             input_concat_cond = torch.cat([conditioning_tensors[key][0] for key in self.input_concat_ids], dim=1)
 
+        if len(self.local_add_cond_ids) > 0:
+            # Concatenate all local conditioning inputs over the channel dimension
+            # Assumes that the local conditioning inputs are of shape (batch, channels, seq)
+            local_add_cond = torch.cat([conditioning_tensors[key][0] for key in self.local_add_cond_ids], dim=1)
+
+        if len(self.modular_local_cond_ids) > 0:
+            # Keep modular local conditioning as a dict of tensors (not concatenated)
+            # Each tensor is of shape (batch, channels, seq)
+            modular_local_cond = {}
+            for key in self.modular_local_cond_ids:
+                if key in conditioning_tensors:
+                    modular_local_cond[key] = conditioning_tensors[key][0]
+            # Only set if we have any conditioning
+            if len(modular_local_cond) == 0:
+                modular_local_cond = None
+
         if len(self.prepend_cond_ids) > 0:
             # Concatenate all prepend conditioning inputs over the sequence dimension
             # Assumes that the prepend conditioning inputs are of shape (batch, seq, channels)
@@ -209,6 +260,8 @@ class ConditionedDiffusionModelWrapper(nn.Module):
                 "cross_attn_mask": cross_attention_masks,
                 "global_cond": global_cond,
                 "input_concat_cond": input_concat_cond,
+                "local_add_cond": local_add_cond,
+                "modular_local_cond": modular_local_cond,
                 "prepend_cond": prepend_cond,
                 "prepend_cond_mask": prepend_cond_mask
             }
@@ -252,6 +305,7 @@ class UNetCFG1DWrapper(ConditionedDiffusionModel):
                 negative_input_concat_cond=None,
                 prepend_cond=None,
                 prepend_cond_mask=None,
+                local_add_cond=None,
                 **kwargs):
         p = Profiler()
 
@@ -301,6 +355,7 @@ class UNet1DCondWrapper(ConditionedDiffusionModel):
                 x,
                 t,
                 input_concat_cond=None,
+                local_add_cond=None,
                 global_cond=None,
                 cross_attn_cond=None,
                 cross_attn_mask=None,
@@ -374,6 +429,7 @@ class DAU1DCondWrapper(ConditionedDiffusionModel):
                 x,
                 t,
                 input_concat_cond=None,
+                local_add_cond=None,
                 cross_attn_cond=None,
                 cross_attn_mask=None,
                 global_cond=None,
@@ -525,6 +581,7 @@ class DiTWrapper(ConditionedDiffusionModel):
                 negative_cross_attn_cond=None,
                 negative_cross_attn_mask=None,
                 input_concat_cond=None,
+                local_add_cond=None,
                 negative_input_concat_cond=None,
                 global_cond=None,
                 negative_global_cond=None,
@@ -554,6 +611,7 @@ class DiTWrapper(ConditionedDiffusionModel):
             cfg_dropout_prob=cfg_dropout_prob,
             scale_phi=scale_phi,
             global_embed=global_cond,
+            local_add_cond=local_add_cond,
             **kwargs)
 
 class DiTUncondWrapper(DiffusionModel):
@@ -643,12 +701,20 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     diffusion_model_config = diffusion_config.get('config', None)
     assert diffusion_model_config is not None, "Must specify diffusion model config"
 
+    # Parse modular_local_cond_configs before model creation (needed for DiT)
+    modular_local_cond_configs = diffusion_config.get('modular_local_cond_configs', [])
+
     if diffusion_model_type == 'adp_cfg_1d':
         diffusion_model = UNetCFG1DWrapper(**diffusion_model_config)
     elif diffusion_model_type == 'adp_1d':
         diffusion_model = UNet1DCondWrapper(**diffusion_model_config)
     elif diffusion_model_type == 'dit':
-        diffusion_model = DiTWrapper(diffusion_objective=diffusion_objective, **diffusion_model_config)
+        # Pass modular_local_cond_configs to the DiT model
+        diffusion_model = DiTWrapper(
+            diffusion_objective=diffusion_objective,
+            modular_local_cond_configs=modular_local_cond_configs,
+            **diffusion_model_config
+        )
 
     io_channels = model_config.get('io_channels', None)
     assert io_channels is not None, "Must specify io_channels in model config"
@@ -660,11 +726,16 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
     cross_attention_ids = diffusion_config.get('cross_attention_cond_ids', [])
     global_cond_ids = diffusion_config.get('global_cond_ids', [])
     input_concat_ids = diffusion_config.get('input_concat_ids', [])
+    local_add_cond_ids = diffusion_config.get('local_add_cond_ids', [])
+    modular_local_cond_ids = [c["id"] for c in modular_local_cond_configs]
     prepend_cond_ids = diffusion_config.get('prepend_cond_ids', [])
 
     pretransform = model_config.get("pretransform", None)
 
     distribution_shift_options = diffusion_config.get("distribution_shift_options", None)
+    sampling_distribution_shift_options = diffusion_config.get("sampling_distribution_shift_options", None)
+    mask_padding_attention = diffusion_config.get("mask_padding_attention", False)
+    use_effective_length_for_schedule = diffusion_config.get("use_effective_length_for_schedule", False)
 
     if pretransform is not None:
         pretransform = create_pretransform_from_config(pretransform, sample_rate)
@@ -700,9 +771,14 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         cross_attn_cond_ids=cross_attention_ids,
         global_cond_ids=global_cond_ids,
         input_concat_ids=input_concat_ids,
+        local_add_cond_ids=local_add_cond_ids,
+        modular_local_cond_ids=modular_local_cond_ids,
         prepend_cond_ids=prepend_cond_ids,
         pretransform=pretransform,
         io_channels=io_channels,
         distribution_shift_options=distribution_shift_options,
+        sampling_distribution_shift_options=sampling_distribution_shift_options,
+        mask_padding_attention=mask_padding_attention,
+        use_effective_length_for_schedule=use_effective_length_for_schedule,
         **extra_kwargs
     )

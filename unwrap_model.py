@@ -7,6 +7,8 @@ if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--model-config', type=str, default=None)
     args.add_argument('--ckpt-path', type=str, default=None)
+    args.add_argument('--pretransform-ckpt-path', type=str, default=None,
+                      help='Optional path to a pretransform checkpoint to swap in before export')
     args.add_argument('--name', type=str, default='exported_model')
     args.add_argument('--use-safetensors', action='store_true')
 
@@ -101,11 +103,34 @@ if __name__ == '__main__':
             ema_copy=ema_copy,
             optimizer_configs=training_config.get("optimizer_configs", None)
         )
+    elif model_type == 'clap':
+        from stable_audio_tools.training.clap import CLAPTrainingWrapper
+                
+        training_wrapper = CLAPTrainingWrapper.load_from_checkpoint(
+            args.ckpt_path, 
+            model=model, 
+            lr=training_config.get("learning_rate", None),
+            optimizer_configs=training_config.get("optimizer_configs", None),
+            strict=False
+        )
 
     else:
         raise ValueError(f"Unknown model type {model_type}")
     
     print(f"Loaded model from {args.ckpt_path}")
+
+    if args.pretransform_ckpt_path is not None:
+        from stable_audio_tools.models.utils import load_ckpt_state_dict
+        if getattr(model, "pretransform", None) is None:
+            raise ValueError(
+                f"--pretransform-ckpt-path was provided but model_type={model_type!r} "
+                f"has no pretransform"
+            )
+        print(f"Loading pretransform checkpoint from {args.pretransform_ckpt_path}")
+        model.pretransform.load_state_dict(
+            load_ckpt_state_dict(args.pretransform_ckpt_path), strict=False
+        )
+        print("Done loading pretransform")
 
     if args.use_safetensors:
         ckpt_path = f"{args.name}.safetensors"

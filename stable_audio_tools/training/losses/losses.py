@@ -1,5 +1,7 @@
+import math
 import typing as tp
 import torch
+import torchaudio 
 
 from torch.nn import functional as F
 from torch import nn
@@ -124,9 +126,12 @@ class MultiLoss(nn.Module):
         losses = {}
 
         for loss_module in self.losses:
-            module_loss = loss_module(info)
-            total_loss += module_loss
-            losses[loss_module.name] = module_loss
+            try:
+                module_loss = loss_module(info)
+                total_loss += module_loss
+                losses[loss_module.name] = module_loss
+            except KeyError:
+                continue
 
         return total_loss, losses
 

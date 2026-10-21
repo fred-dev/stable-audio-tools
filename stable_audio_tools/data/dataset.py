@@ -3,6 +3,7 @@ import numpy as np
 import io
 import json
 import os
+import dill
 import posixpath
 import random
 import re
@@ -17,7 +18,7 @@ from torch import nn
 from torchaudio import transforms as T
 from typing import Optional, Callable, List
 
-from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T, VolumeNorm
+from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T, VolumeNorm, strip_trailing_silence
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
 
@@ -94,13 +95,26 @@ def keyword_scandir(
 def get_audio_filenames(
     paths: list,  # directories in which to search
     keywords=None,
-    exts=['.wav', '.mp3', '.flac', '.ogg', '.aif', '.opus']
+    exts=['.wav', '.mp3', '.flac', '.ogg', '.aif', '.opus'],
+    filelist_path=None
 ):
     "recursively get a list of audio filenames"
     filenames = []
     if type(paths) is str:
         paths = [paths]
     for path in paths:               # get a list of relevant filenames
+
+        if filelist_path is None:
+            # Check for filelist.txt at the root of the directory
+            filelist_path = os.path.join(path, "filelist.txt")
+            
+        if os.path.exists(filelist_path):
+            with open(filelist_path, "r") as f:
+                files = f.readlines()
+                files = [os.path.join(path, file.strip()) for file in files]
+                filenames.extend(files)
+            continue
+
         if keywords is not None:
             subfolders, files = keyword_scandir(path, exts, keywords)
         else:
@@ -109,8 +123,9 @@ def get_audio_filenames(
     return filenames
 
 def get_latent_filenames(
-    paths: list,  # directories in which to search
-    extensions=['npy']
+    paths,  # directories in which to search
+    extension='npy',
+    filelist_path=None
 ):
     "recursively get a list of pre-encoded filenames"
     filenames = []
@@ -118,8 +133,10 @@ def get_latent_filenames(
         paths = [paths]
     for path in paths:               # get a list of relevant filenames
 
-        # Check for filelist.txt at the root of the directory
-        filelist_path = path + "/filelist.txt"
+        if filelist_path is None:
+            # Check for filelist.txt at the root of the directory
+            filelist_path = os.path.join(path, "filelist.txt")
+        
         if os.path.exists(filelist_path):
             with open(filelist_path, "r") as f:
                 files = f.readlines()
@@ -127,8 +144,15 @@ def get_latent_filenames(
                 filenames.extend(files)
             continue
 
-        _, files = fast_scandir(path, extensions)
+        _, files = fast_scandir(path, [extension])
         filenames.extend(files)
+
+    # Filter out silence.npy (used for silence latent padding, not a data sample)
+    filenames = [f for f in filenames if os.path.basename(f) != "silence.npy"]
+
+    # Add metadata paths
+    filenames = [(filename, filename.replace(f".{extension}", ".json")) for filename in filenames]
+
     return filenames
 
 class LocalDatasetConfig:
@@ -136,49 +160,79 @@ class LocalDatasetConfig:
         self,
         id: str,
         path: str,
-        custom_metadata_fn: Optional[Callable[[str], str]] = None
+        keywords: Optional[List[str]]=None,
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+        filelist_path = None,
+        weight: float = 1.0,
     ):
         self.id = id
         self.path = path
         self.custom_metadata_fn = custom_metadata_fn
+        self.keywords = keywords
+        self.filelist_path = filelist_path
+        self.weight = weight
+
+class LatentDatasetConfig(LocalDatasetConfig):
+    def __init__(
+        self,
+        latent_extension: str = "npy",
+        filelist_path = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.latent_extension = latent_extension
+        self.filelist_path = filelist_path
+        # weight is inherited from LocalDatasetConfig via **kwargs
 
 class SampleDataset(torch.utils.data.Dataset):
     def __init__(
-        self, 
+        self,
         configs,
-        sample_size=65536, 
-        sample_rate=48000, 
-        keywords=None, 
+        sample_size=65536,
+        sample_rate=48000,
         random_crop=True,
-        force_channels="stereo"
+        force_channels="stereo",
+        volume_norm=False,
+        volume_norm_param=(-16, 2),
+        strip_silence=False,
+        pad=True,
     ):
         super().__init__()
         self.filenames = []
+        self.sample_weights = []
 
         self.augs = torch.nn.Sequential(
-            PhaseFlipper()
+            PhaseFlipper(),
+            #nn.Identity()
         )
+
 
         self.root_paths = []
 
-        self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop)
+        self.pad_crop = PadCrop_Normalized_T(sample_size, sample_rate, randomize=random_crop, pad=pad)
+        self.strip_silence = strip_silence
 
         self.force_channels = force_channels
 
         self.encoding = torch.nn.Sequential(
             Stereo() if self.force_channels == "stereo" else torch.nn.Identity(),
-            Mono() if self.force_channels == "mono" else torch.nn.Identity(),
+            Mono() if self.force_channels == "mono" else torch.nn.Identity()
         )
 
         self.sr = sample_rate
+
+        self.volume_norm = VolumeNorm(volume_norm_param, self.sr) if volume_norm else torch.nn.Identity()
 
         self.custom_metadata_fns = {}
 
         for config in configs:
             self.root_paths.append(config.path)
-            self.filenames.extend(get_audio_filenames(config.path, keywords))
+            new_files = get_audio_filenames(config.path, config.keywords, filelist_path=config.filelist_path)
+            self.filenames.extend(new_files)
+            self.sample_weights.extend([config.weight] * len(new_files))
             if config.custom_metadata_fn is not None:
-                self.custom_metadata_fns[config.path] = config.custom_metadata_fn
+                self.custom_metadata_fns[config.path] = dill.dumps(config.custom_metadata_fn)
 
         print(f'Found {len(self.filenames)} files')
 
@@ -201,6 +255,11 @@ class SampleDataset(torch.utils.data.Dataset):
         try:
             start_time = time.time()
             audio = self.load_file(audio_filename)
+
+            audio = self.volume_norm(audio)
+
+            if self.strip_silence:
+                audio = strip_trailing_silence(audio, self.sr)
 
             audio, t_start, t_end, seconds_start, seconds_total, padding_mask = self.pad_crop(audio)
 
@@ -229,7 +288,7 @@ class SampleDataset(torch.utils.data.Dataset):
             info["timestamps"] = (t_start, t_end)
             info["seconds_start"] = seconds_start
             info["seconds_total"] = seconds_total
-            info["padding_mask"] = padding_mask
+            info["padding_mask"] = [padding_mask]
             info["sample_rate"] = self.sr
 
             end_time = time.time()
@@ -238,7 +297,7 @@ class SampleDataset(torch.utils.data.Dataset):
 
             for custom_md_path in self.custom_metadata_fns.keys():
                 if custom_md_path in audio_filename:
-                    custom_metadata_fn = self.custom_metadata_fns[custom_md_path]
+                    custom_metadata_fn = dill.loads(self.custom_metadata_fns[custom_md_path])
                     custom_metadata = custom_metadata_fn(info, audio)
                     info.update(custom_metadata)
 
@@ -264,25 +323,36 @@ class SampleDataset(torch.utils.data.Dataset):
 
 class PreEncodedDataset(torch.utils.data.Dataset):
     def __init__(
-        self, 
-        configs: List[LocalDatasetConfig],
+        self,
+        configs: List[LatentDatasetConfig],
         latent_crop_length=None,
         min_length_sec=None,
         max_length_sec=None,
         random_crop=False,
-        latent_extension='npy'
+        tokenizers: Optional[dict] = None,
     ):
         super().__init__()
         self.filenames = []
+        self.sample_weights = []
 
         self.custom_metadata_fns = {}
 
-        self.latent_extension = latent_extension
+        self.silence_latents = {}
 
         for config in configs:
-            self.filenames.extend(get_latent_filenames(config.path, [latent_extension]))
+            new_files = get_latent_filenames(config.path, config.latent_extension, config.filelist_path)
+            self.filenames.extend(new_files)
+            self.sample_weights.extend([config.weight] * len(new_files))
             if config.custom_metadata_fn is not None:
-                self.custom_metadata_fns[config.path] = config.custom_metadata_fn
+                self.custom_metadata_fns[config.path] = dill.dumps(config.custom_metadata_fn)
+
+            # Load silence latent if available (for variable-length padding)
+            paths = config.path if isinstance(config.path, list) else [config.path]
+            for path in paths:
+                silence_path = os.path.join(path, "silence.npy")
+                if os.path.exists(silence_path):
+                    self.silence_latents[path] = np.load(silence_path).squeeze(0)  # [C, N]
+                    print(f'Loaded silence latent from {silence_path}')
 
         self.latent_crop_length = latent_crop_length
         self.random_crop = random_crop
@@ -290,17 +360,26 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         self.min_length_sec = min_length_sec
         self.max_length_sec = max_length_sec
 
+        # tokenizers: dict mapping metadata key -> (tokenizer, max_length)
+        # If provided, text fields will be pre-tokenized in DataLoader workers
+        self.tokenizers = tokenizers
+
         print(f'Found {len(self.filenames)} files')
 
     def __len__(self):
         return len(self.filenames)
 
+    def _get_silence_for_file(self, latent_filename):
+        """Return the silence latent for the dataset that contains this file, or None."""
+        for path, silence in self.silence_latents.items():
+            if path in latent_filename:
+                return silence
+        return None
+
     def __getitem__(self, idx):
-        latent_filename = self.filenames[idx]
+        latent_filename, md_filename = self.filenames[idx]
         try:
             latents = torch.from_numpy(np.load(latent_filename)) # [C, N]
-
-            md_filename = latent_filename.replace(f".{self.latent_extension}", ".json")
 
             with open(md_filename, "r") as f:
                 try:
@@ -311,21 +390,47 @@ class PreEncodedDataset(torch.utils.data.Dataset):
             info["latent_filename"] = latent_filename
 
             if self.latent_crop_length is not None:
+                stored_length = latents.shape[1]
 
-                # Get the last index from the padding mask, the index of the last 1 in the sequence
-                last_ix = len(info["padding_mask"]) - 1 - info["padding_mask"][::-1].index(1)
+                if stored_length > self.latent_crop_length:
+                    # Crop to latent_crop_length (existing logic)
+                    # Get the last index from the padding mask, the index of the last 1 in the sequence
+                    last_ix = len(info["padding_mask"]) - 1 - info["padding_mask"][::-1].index(1)
 
-                if self.random_crop and last_ix > self.latent_crop_length:
-                    start = random.randint(0, last_ix - self.latent_crop_length)
+                    if self.random_crop and last_ix > self.latent_crop_length:
+                        start = random.randint(0, last_ix - self.latent_crop_length)
+                    else:
+                        start = 0
+
+                    latents = latents[:, start:start+self.latent_crop_length]
+                    info["padding_mask"] = info["padding_mask"][start:start+self.latent_crop_length]
+                    info["latent_crop_start"] = start
+
+                elif stored_length < self.latent_crop_length:
+                    # Pad with silence latent to reach latent_crop_length
+                    pad_needed = self.latent_crop_length - stored_length
+                    silence = self._get_silence_for_file(latent_filename)
+
+                    if silence is not None:
+                        # Slice or tile silence latent to cover pad_needed frames
+                        if silence.shape[1] >= pad_needed:
+                            silence_pad = silence[:, :pad_needed]
+                        else:
+                            silence_pad = np.tile(silence, (1, (pad_needed // silence.shape[1]) + 1))[:, :pad_needed]
+                        latents = torch.cat([latents, torch.from_numpy(silence_pad)], dim=1)
+                    else:
+                        # No silence latent available — zero-pad as fallback
+                        latents = torch.nn.functional.pad(latents, (0, pad_needed))
+
+                    # Build padding_mask: valid frames from stored mask, zeros for padding
+                    info["padding_mask"] = info["padding_mask"][:stored_length] + [0] * pad_needed
+                    info["latent_crop_start"] = 0
+
                 else:
-                    start = 0
-                    
-                latents = latents[:, start:start+self.latent_crop_length]
-
-                info["padding_mask"] = info["padding_mask"][start:start+self.latent_crop_length]
+                    # Exact match
+                    info["latent_crop_start"] = 0
 
                 info["latent_crop_length"] = self.latent_crop_length
-                info["latent_crop_start"] = start
 
             info["padding_mask"] = [torch.tensor(info["padding_mask"])]
 
@@ -339,8 +444,8 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
             for custom_md_path in self.custom_metadata_fns.keys():
                 if custom_md_path in latent_filename:
-                    custom_metadata_fn = self.custom_metadata_fns[custom_md_path]
-                    custom_metadata = custom_metadata_fn(info, None)
+                    custom_metadata_fn = dill.loads(self.custom_metadata_fns[custom_md_path])
+                    custom_metadata = custom_metadata_fn(info, latents)
                     info.update(custom_metadata)
 
                 if "__reject__" in info and info["__reject__"]:
@@ -351,6 +456,25 @@ class PreEncodedDataset(torch.utils.data.Dataset):
                     latents = info["__replace__"]
 
             info["audio"] = latents
+
+            # Pre-tokenize text fields in DataLoader workers to avoid
+            # CPU contention with the main training thread
+            if self.tokenizers is not None:
+                for key, (tokenizer, max_length) in self.tokenizers.items():
+                    if key in info and isinstance(info[key], str):
+                        # Save raw text before replacing with tokens (needed by CLAP and other text-based losses)
+                        info[f"{key}_text"] = info[key]
+                        encoded = tokenizer(
+                            info[key],
+                            truncation=True,
+                            max_length=max_length,
+                            padding="max_length",
+                            return_tensors="pt",
+                        )
+                        info[key] = {
+                            "input_ids": encoded["input_ids"].squeeze(0),
+                            "attention_mask": encoded["attention_mask"].squeeze(0),
+                        }
 
             return (latents, info)
         except Exception as e:
@@ -633,6 +757,10 @@ def collation_fn(samples):
                 b = np.array(b)
             elif isinstance(b[0], torch.Tensor):
                 b = torch.stack(b)
+            elif isinstance(b[0], list) and isinstance(b[0][0], torch.Tensor):
+                # This preserves the [Batch, List, Tensor] structure 
+                # expected by the md["padding_mask"][0] logic
+                b = b
             elif isinstance(b[0], np.ndarray):
                 b = np.array(b)
             else:
@@ -659,7 +787,10 @@ class WebDatasetDataLoader():
         volume_norm_param=(-16, 2),
         pre_encoded=False,
         latent_crop_length=None,
+        min_length_sec=None,
+        max_length_sec=None,
         resampled_shards=True,
+        strip_silence=False,
         **data_loader_kwargs
     ):
 
@@ -672,11 +803,14 @@ class WebDatasetDataLoader():
         self.augment_phase = augment_phase
         self.pre_encoded = pre_encoded
         self.latent_crop_length = latent_crop_length
+        self.min_length_sec = min_length_sec
+        self.max_length_sec = max_length_sec
         self.volume_norm = volume_norm
         self.volume_norm_param = volume_norm_param
         self.remove_silence = remove_silence
         self.silence_threshold = silence_threshold
         self.max_silence_duration = max_silence_duration
+        self.strip_silence = strip_silence
 
         urls = [dataset.load_data_urls() for dataset in datasets]
 
@@ -701,10 +835,8 @@ class WebDatasetDataLoader():
         if resampled_shards:
             self.dataset = self.dataset.with_epoch(epoch_steps//num_workers if num_workers > 0 else epoch_steps)
 
-        def worker_init_fn(worker_id):
-            torch.multiprocessing.set_sharing_strategy('file_system')
-
-        self.data_loader = wds.WebLoader(self.dataset, num_workers=num_workers, worker_init_fn=worker_init_fn, **data_loader_kwargs)
+        data_loader_kwargs.setdefault('persistent_workers', num_workers > 0)
+        self.data_loader = wds.WebLoader(self.dataset, num_workers=num_workers, **data_loader_kwargs)
 
     def wds_preprocess(self, sample):
 
@@ -729,6 +861,14 @@ class WebDatasetDataLoader():
                 padding_mask = padding_mask[start:start+self.latent_crop_length]
 
             sample["json"]["padding_mask"] = torch.tensor(padding_mask)
+
+            # Filter by length if min/max length is specified
+            seconds_total = sample["json"].get("seconds_total", None)
+            if seconds_total is not None:
+                if self.min_length_sec is not None and seconds_total < self.min_length_sec:
+                    sample["json"]["__reject__"] = True
+                if self.max_length_sec is not None and seconds_total > self.max_length_sec:
+                    sample["json"]["__reject__"] = True
         else:
             found_key, rewrite_key = '', ''
             for k, v in sample.items():  # print the all entries in dict
@@ -750,6 +890,9 @@ class WebDatasetDataLoader():
                     # Replace the long silence by the short for the mono audios
             if audio.shape[0] == 1 and self.remove_silence:
                 audio = remove_long_silence(audio, self.sample_rate, self.silence_threshold, self.max_silence_duration)
+
+            if self.strip_silence:
+                audio = strip_trailing_silence(audio, self.sample_rate)
 
             if self.sample_size is not None:
                 # Pad/crop and get the relative timestamp
@@ -791,7 +934,7 @@ class WebDatasetDataLoader():
                 continue
         
             if dataset.path in sample["__url__"]:
-                custom_metadata = dataset.custom_metadata_fn(sample["json"], audio)
+                custom_metadata = dill.loads(dataset.custom_metadata_fn)(sample["json"], audio)
                 sample["json"].update(custom_metadata)
 
         sample["audio"] = audio
@@ -800,7 +943,19 @@ class WebDatasetDataLoader():
         
         return sample
 
-def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4, shuffle = True):
+def _maybe_create_weighted_sampler(dataset):
+    """Create a WeightedRandomSampler if any dataset has non-default weights, otherwise return None."""
+    weights = dataset.sample_weights
+    if not weights or all(w == 1.0 for w in weights):
+        return None
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
+    return sampler
+
+def create_dataloader_from_config(dataset_config, batch_size, sample_size, sample_rate, audio_channels=2, num_workers=4, shuffle = True, tokenizers=None, pad=True):
 
     dataset_type = dataset_config.get("dataset_type", None)
 
@@ -837,7 +992,10 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
                 LocalDatasetConfig(
                     id=audio_dir_config["id"],
                     path=audio_dir_path,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn=custom_metadata_fn,
+                    keywords=audio_dir_config.get("keywords", None),
+                    filelist_path=audio_dir_config.get("filelist_path", None),
+                    weight=audio_dir_config.get("weight", 1.0),
                 )
             )
 
@@ -846,10 +1004,17 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             sample_rate=sample_rate,
             sample_size=sample_size,
             random_crop=dataset_config.get("random_crop", True),
-            force_channels=force_channels
+            force_channels=force_channels,
+            volume_norm=dataset_config.get("volume_norm", False),
+            volume_norm_param=dataset_config.get("volume_norm_param", (-16, 2)),
+            strip_silence=dataset_config.get("strip_silence", False),
+            pad=pad,
         )
 
-        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
+        sampler = _maybe_create_weighted_sampler(train_set)
+
+        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle if sampler is None else False,
+                                sampler=sampler,
                                 num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
 
     elif dataset_type == "pre_encoded":
@@ -881,26 +1046,31 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
                 custom_metadata_fn = metadata_module.get_custom_metadata
 
             configs.append(
-                LocalDatasetConfig(
+                LatentDatasetConfig(
                     id=pre_encoded_dir_config["id"],
                     path=pre_encoded_dir_path,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn=custom_metadata_fn,
+                    latent_extension=pre_encoded_dir_config.get("latent_extension", 'npy'),
+                    filelist_path=pre_encoded_dir_config.get("filelist_path", None),
+                    weight=pre_encoded_dir_config.get("weight", 1.0),
                 )
             )
 
-        latent_extension = dataset_config.get("latent_extension", 'npy')
-
         train_set = PreEncodedDataset(
-            configs, 
-            latent_crop_length=latent_crop_length, 
-            min_length_sec=min_length_sec, 
-            max_length_sec=max_length_sec, 
-            random_crop=random_crop, 
-            latent_extension=latent_extension
+            configs,
+            latent_crop_length=latent_crop_length,
+            min_length_sec=min_length_sec,
+            max_length_sec=max_length_sec,
+            random_crop=random_crop,
+            tokenizers=tokenizers,
         )
 
-        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
-                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+        sampler = _maybe_create_weighted_sampler(train_set)
+
+        return torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle if sampler is None else False,
+                                sampler=sampler,
+                                num_workers=num_workers, persistent_workers=True, pin_memory=True, drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn,
+                                prefetch_factor=2 if num_workers > 0 else None)
 
     elif dataset_type in ["s3", "wds"]: # Support "s3" type for backwards compatibility
         wds_configs = []
@@ -915,7 +1085,7 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
                 metadata_module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(metadata_module)                
 
-                custom_metadata_fn = metadata_module.get_custom_metadata
+                custom_metadata_fn = dill.dumps(metadata_module.get_custom_metadata)
 
             if "s3_path" in wds_config:
 
@@ -956,5 +1126,8 @@ def create_dataloader_from_config(dataset_config, batch_size, sample_size, sampl
             epoch_steps=dataset_config.get("epoch_steps", 2000),
             pre_encoded=dataset_config.get("pre_encoded", False),
             latent_crop_length=dataset_config.get("latent_crop_length", None),
-            resampled_shards=dataset_config.get("resampled_shards", True)
+            min_length_sec=dataset_config.get("min_length_sec", None),
+            max_length_sec=dataset_config.get("max_length_sec", None),
+            resampled_shards=dataset_config.get("resampled_shards", True),
+            strip_silence=dataset_config.get("strip_silence", False),
         ).data_loader

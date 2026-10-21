@@ -1,11 +1,15 @@
 import numpy as np
-import random 
+import random
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from einops import rearrange
+
+from .blocks import SnakeBeta
+from .transformer import RunningInstanceNorm
+
 
 class Bottleneck(nn.Module):
     def __init__(self, is_discrete: bool = False):
@@ -32,7 +36,7 @@ class DiscreteBottleneck(Bottleneck):
 
 
 class SoftNormBottleneck(Bottleneck):
-    def __init__(self, dim = 32, noise_augment_dim=0, noise_regularize = False):
+    def __init__(self, dim = 32, noise_augment_dim=0, noise_regularize = False, auto_scale = False, freeze = False):
         super().__init__(is_discrete=False)
 
         self.noise_augment_dim = noise_augment_dim
@@ -40,15 +44,26 @@ class SoftNormBottleneck(Bottleneck):
         self.bias = nn.Parameter(torch.zeros(1,dim,1))
         self.noise_scaling_factor = nn.Parameter(torch.ones(1,noise_augment_dim,1))
         self.noise_regularize = noise_regularize
-        #self.norm = RunningInstanceNorm(dim, momentum = 0.999, trainable_gain = False)
+        self.freeze = freeze
+        if self.freeze:
+            self.scaling_factor.requires_grad = False
+            self.bias.requires_grad = False
+            self.noise_scaling_factor.requires_grad = False
+        if auto_scale:
+            running_std = torch.ones(1)
+            self.register_parameter("running_std", nn.Parameter(running_std, requires_grad=False))
 
-    def encode(self, x, return_info=False):
+    def encode(self, x, return_info=False, **kwargs):
         info = {}
 
         x = x * self.scaling_factor + self.bias
-        #x = rearrange(x, "b c n -> b n c")
-        #x = self.norm(x)
-        #x = rearrange(x, "b n c -> b c n")
+
+        if self.training and hasattr(self,"running_std") and not self.freeze:
+            # Update running std
+            self.running_std.data = (self.running_std.data * 0.999 + x.std().detach() * 0.001).clamp(min = 1e-4)
+        
+        if hasattr(self, "running_std"):
+            x = x / self.running_std
 
         if self.training and return_info:
             var = (x.std(dim=-1) ** 2).clip(min = 1e-4)
@@ -66,11 +81,22 @@ class SoftNormBottleneck(Bottleneck):
         
         return x
 
-    def decode(self, x):
-        if self.noise_regularize and self.training:
-            scaling = x.std(dim = -1)
-            noise = torch.randn_like(x) * scaling.unsqueeze(-1) * 1e-2
+    def decode(self, x, **kwargs):
+        if hasattr(self, "running_std"):
+            x = x * self.running_std
+
+        if self.noise_regularize:
+            if hasattr(self, "running_std"):
+                scaling = self.running_std
+            else:
+                scaling = x.std(dim = -1).unsqueeze(-1)
+            if self.training:
+                scale = 5e-2
+            else:
+                scale = 1e-3
+            noise = torch.randn_like(x) * scaling * scale
             x = x + noise
+
         if self.noise_augment_dim > 0:
             noise = self.noise_scaling_factor * torch.randn(x.shape[0], self.noise_augment_dim,
                                 x.shape[-1]).type_as(x)
@@ -204,16 +230,25 @@ class L2Bottleneck(Bottleneck):
         
 class RVQBottleneck(DiscreteBottleneck):
     def __init__(self, **quantizer_kwargs):
+        # Prevent DDP deadlock: quantize_dropout + sync_codebook are incompatible
+        if quantizer_kwargs.get("quantize_dropout", False):
+            quantizer_kwargs.setdefault("sync_codebook", False)
         super().__init__(num_quantizers = quantizer_kwargs["num_quantizers"], codebook_size = quantizer_kwargs["codebook_size"], tokens_id = "quantizer_indices")
         from vector_quantize_pytorch import ResidualVQ
         self.quantizer = ResidualVQ(**quantizer_kwargs)
         self.num_quantizers = quantizer_kwargs["num_quantizers"]
 
-    def encode(self, x, return_info=False, **kwargs):
+    def encode(self, x, return_info=False, n_active=None, **kwargs):
         info = {}
 
         x = rearrange(x, "b c n -> b n c")
         x, indices, loss = self.quantizer(x)
+
+        # Inference-time: reconstruct from only n_active codebooks if requested.
+        # Training-time variable codebooks are handled by quantize_dropout in the library.
+        if not self.training and n_active is not None and n_active < self.num_quantizers:
+            x = self.quantizer.get_output_from_indices(indices[:, :, :n_active])
+
         x = rearrange(x, "b n c -> b c n")
 
         info["quantizer_indices"] = indices
@@ -221,17 +256,15 @@ class RVQBottleneck(DiscreteBottleneck):
 
         if return_info:
             return x, info
-        else:
-            return x
-        
+        return x
+
     def decode(self, x):
         return x
-    
-    def decode_tokens(self, codes, **kwargs):
-        latents = self.quantizer.get_outputs_from_indices(codes)
 
+    def decode_tokens(self, codes, **kwargs):
+        latents = self.quantizer.get_output_from_indices(codes)
         return self.decode(latents, **kwargs)
-    
+
 class RVQVAEBottleneck(DiscreteBottleneck):
     def __init__(self, **quantizer_kwargs):
         super().__init__(num_quantizers = quantizer_kwargs["num_quantizers"], codebook_size = quantizer_kwargs["codebook_size"], tokens_id = "quantizer_indices")
@@ -262,7 +295,7 @@ class RVQVAEBottleneck(DiscreteBottleneck):
         return x
     
     def decode_tokens(self, codes, **kwargs):
-        latents = self.quantizer.get_outputs_from_indices(codes)
+        latents = self.quantizer.get_output_from_indices(codes)
 
         return self.decode(latents, **kwargs)
 
@@ -385,7 +418,7 @@ class FSQBottleneck(DiscreteBottleneck):
 
         self.noise_augment_dim = noise_augment_dim
 
-        self.quantizer = FSQ(**kwargs, allowed_dtypes=[torch.float16, torch.float32, torch.float64])
+        self.quantizer = FSQ(**kwargs, allowed_dtypes=[torch.float16, torch.bfloat16, torch.float32, torch.float64])
 
     def encode(self, x, return_info=False):
         info = {}

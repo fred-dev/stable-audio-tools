@@ -1,3 +1,4 @@
+import os
 import pytorch_lightning as pl
 import sys, gc
 import random
@@ -6,7 +7,7 @@ import torchaudio
 import typing as tp
 import wandb
 
-from ema_pytorch import EMA
+from .ema import EMA
 from einops import rearrange
 from safetensors.torch import save_file
 from torch import optim
@@ -15,7 +16,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 from ..interface.aeiou import pca_point_cloud, audio_spectrogram_image, tokens_spectrogram_image
 from ..models.lm import AudioLanguageModelWrapper
-from .utils import create_optimizer_from_config, create_scheduler_from_config, log_audio, log_image
+from .utils import create_optimizer_from_config, create_scheduler_from_config, log_audio, log_image, resize_padding_mask
 
 class AudioLanguageModelTrainingWrapper(pl.LightningModule):
     def __init__(
@@ -131,8 +132,7 @@ class AudioLanguageModelTrainingWrapper(pl.LightningModule):
             
         padding_masks = torch.stack(padding_masks, dim=0).to(self.device) # Shape (batch_size, sequence_length)
 
-        # Interpolate padding masks to the same length as the codes
-        padding_masks = F.interpolate(padding_masks.unsqueeze(1).float(), size=codes.shape[2], mode='nearest').bool()
+        padding_masks = resize_padding_mask(padding_masks, codes.shape[2]).unsqueeze(1)
     
         condition_tensors = None
 
@@ -255,6 +255,7 @@ class AudioLanguageModelDemoCallback(pl.Callback):
                 log_image(
                     trainer.logger, f'demo_melspec_left_cfg_{cfg_scale}',
                     audio_spectrogram_image(fakes))
+                os.remove(filename)
 
         except Exception as e:
             raise e

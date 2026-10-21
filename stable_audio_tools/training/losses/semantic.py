@@ -71,6 +71,122 @@ class HubertLoss(nn.Module):
         loss = loss / denom
         return self.weight * loss
 
+class CLAPLoss(nn.Module):
+    """Feature matching loss using CLAP (HTSAT) intermediate layer features.
+
+    Extracts features from the HTSAT Swin Transformer BasicLayer stages
+    in CLAP's audio branch and computes L1 loss normalized by target
+    feature standard deviation, following the same pattern as HubertLoss.
+
+    HTSAT-base has 4 BasicLayer stages with output dimensions
+    [256, 512, 1024, 1024]. Use feature_ids to select specific layers
+    (0-3), or None for all layers.
+
+    Only non-fusion CLAP models are supported (fusion models require
+    precomputed mel spectrograms with a non-differentiable pipeline).
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 48000,
+        clap_model: str = 'music_audioset_epoch_15_esc_90.14.pt',
+        feature_ids: tp.Optional[tp.List[int]] = None,
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.feature_ids = feature_ids
+        self.source_sample_rate = sample_rate
+        self.clap_sample_rate = 48000
+        self.clap_max_len = 480000  # 10 seconds at 48kHz
+
+        # Load CLAP, keep only the audio branch, discard text encoder
+        from stable_audio_tools.training.metrics.fad_metrics import load_clap_model
+        clap_module = load_clap_model(clap_model=clap_model, device='cpu')
+
+        audio_branch = clap_module.model.audio_branch
+        assert not audio_branch.enable_fusion, (
+            "CLAPLoss only supports non-fusion CLAP models. "
+            "Use e.g. 'music_audioset_epoch_15_esc_90.14.pt'."
+        )
+
+        # Keep only the audio branch — text encoder is not needed
+        self.audio_branch = audio_branch
+        del clap_module
+
+        for param in self.audio_branch.parameters():
+            param.requires_grad = False
+
+        # Resampler for converting source sample rate to 48kHz
+        if self.source_sample_rate != self.clap_sample_rate:
+            self.resampler = torchaudio.transforms.Resample(
+                self.source_sample_rate, self.clap_sample_rate
+            )
+        else:
+            self.resampler = None
+
+    def _preprocess(self, audio):
+        """Resample and pad/truncate to CLAP's expected 10s at 48kHz."""
+        if self.resampler is not None:
+            audio = self.resampler(audio)
+
+        T = audio.shape[-1]
+        if T > self.clap_max_len:
+            audio = audio[..., :self.clap_max_len]
+        elif T < self.clap_max_len:
+            audio = F.pad(audio, (0, self.clap_max_len - T))
+
+        return audio
+
+    def _extract_features(self, audio):
+        """Run audio through HTSAT's spectrogram frontend and transformer
+        layers, returning intermediate features from each BasicLayer."""
+        ab = self.audio_branch
+
+        # Non-fusion spectrogram path
+        x = ab.spectrogram_extractor(audio)  # (B, 1, T, freq_bins)
+        x = ab.logmel_extractor(x)           # (B, 1, T, mel_bins)
+        x = x.transpose(1, 3)
+        x = ab.bn0(x)
+        x = x.transpose(1, 3)
+        # spec_augmenter is skipped since model is in eval mode
+        x = ab.reshape_wav2img(x)
+
+        # Patch embedding + Swin Transformer layers
+        x = ab.patch_embed(x)
+        if ab.ape:
+            x = x + ab.absolute_pos_embed
+        x = ab.pos_drop(x)
+
+        features = []
+        for layer in ab.layers:
+            x, _ = layer(x)
+            features.append(x)
+
+        return features
+
+    @torch.autocast(device_type='cuda', enabled=False)
+    def forward(self, x, y):
+        # Force fp32 — CLAP's STFT and logmel are numerically fragile in fp16
+        x = fold_channels_into_batch(x).float()
+        y = fold_channels_into_batch(y).float()
+
+        x = self._preprocess(x)
+        y = self._preprocess(y)
+
+        x_features = self._extract_features(x)
+        y_features = self._extract_features(y)
+
+        loss = 0
+        denom = 0
+        for i, (xf, yf) in enumerate(zip(x_features, y_features)):
+            if self.feature_ids is None or i in self.feature_ids:
+                loss += F.l1_loss(xf, yf) / (yf.std() + 1e-5)
+                denom += 1
+
+        loss = loss / denom
+        return self.weight * loss
+
 # Implementation taken from:
 # https://github.com/descriptinc/descript-audio-codec/blob/c7cfc5d2647e26471dc394f95846a0830e7bec34/dac/nn/loss.py#L231
 class MelSpectrogramLoss(nn.Module):

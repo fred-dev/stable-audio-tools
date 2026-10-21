@@ -20,6 +20,9 @@ def create_model_from_config(model_config):
     elif model_type == 'lm':
         from .lm import create_audio_lm_from_config
         return create_audio_lm_from_config(model_config)
+    elif model_type == 'clap':
+        from .clap import create_clap_from_config
+        return create_clap_from_config(model_config)
     else:
         raise NotImplementedError(f'Unknown model type: {model_type}')
 
@@ -149,7 +152,10 @@ def create_bottleneck_from_config(bottleneck_config):
         bottleneck = FSQBottleneck(**bottleneck_config["config"])
     elif bottleneck_type == "dithered_fsq":
         from .bottleneck import DitheredFSQBottleneck
-        return DitheredFSQBottleneck(**bottleneck_config["config"])
+        bottleneck = DitheredFSQBottleneck(**bottleneck_config["config"])
+    elif bottleneck_type == "softnorm":
+        from .bottleneck import SoftNormBottleneck
+        bottleneck = SoftNormBottleneck(**bottleneck_config["config"])
     else:
         raise NotImplementedError(f'Unknown bottleneck type: {bottleneck_type}')
     

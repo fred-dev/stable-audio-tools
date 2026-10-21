@@ -1,43 +1,179 @@
-from functools import reduce
+from functools import reduce, partial
+from packaging import version
+import logging
+import math
 
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 from torch.amp import autocast
-from typing import Callable, Literal
-
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
-
-# Ensure device.type is valid for autocast
-valid_autocast_device_types = {"cuda", "cpu"}
-autocast_device_type = device.type if device.type in valid_autocast_device_types else "cpu"
-
+from torch.nn.utils.parametrizations import weight_norm
+from typing import Callable, Literal, Optional
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    flex_attention_available = True
+except ImportError:
+    flex_attention = None
+    create_block_mask = None
+    flex_attention_available = False
 
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
     print(e)
     print('flash_attn not installed, disabling Flash Attention')
     flash_attn_kvpacked_func = None
     flash_attn_func = None
 
+try:
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis
+except ImportError as e:
+    print(e)
+    print('flash_attn varlen/bert_padding not available, disabling varlen attention')
+    flash_attn_varlen_func = None
+    pad_input = None
+    unpad_input = None
+    index_first_axis = None
+
+
+def precompute_varlen_metadata(padding_mask: torch.Tensor):
+    """
+    Precompute varlen attention metadata once to avoid recomputation in every attention layer.
+
+    Args:
+        padding_mask: Boolean tensor of shape (batch, seq_len) where True = valid
+
+    Returns:
+        Dict with cu_seqlens, max_seqlen, indices, batch_size, seq_len for use in attention
+    """
+    if padding_mask is None or unpad_input is None:
+        return None
+
+    batch_size, seq_len = padding_mask.shape
+
+    # Compute cumulative sequence lengths (same for all of q, k, v)
+    seqlens = padding_mask.sum(dim=-1, dtype=torch.int32)
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    max_seqlen = seqlens.max().item()
+
+    # Compute indices for gathering valid tokens
+    # indices maps from packed position -> original (batch, seq) position
+    indices = torch.nonzero(padding_mask.flatten(), as_tuple=False).flatten()
+
+    return {
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+        "indices": indices,
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+    }
+
 from .utils import compile
 
-try: 
-    torch._dynamo.config.cache_size_limit = 5000
-    flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
-except:
-    flex_attention_compiled = flex_attention
+
+def _left_pad_to_match(emb, target_len):
+    """Left-pad or right-trim emb along seq dim to match target_len.
+
+    Used for local conditioning embeddings that need to align with x
+    without affecting prepended tokens (memory tokens, global cond, etc.).
+    """
+    emb_len = emb.shape[-2]
+    if emb_len < target_len:
+        return F.pad(emb, (0, 0, target_len - emb_len, 0), value=0.)
+    elif emb_len > target_len:
+        return emb[:, -target_len:, :]
+    return emb
+
+if flex_attention_available:
+    try:
+        torch._dynamo.config.cache_size_limit = 5000
+        flex_attention_compiled = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+    except Exception as e:
+        logging.debug(f"Could not compile flex_attention, using uncompiled version: {e}")
+        flex_attention_compiled = flex_attention
+else:
+    flex_attention_compiled = None
+
+
+# Cache band block_masks for sliding-window attention fallback (flex_attention path).
+# Keyed by (seq_q, seq_k, w_left, w_right, device). create_block_mask is expensive
+# but the result is reused across all transformer layers and forward passes.
+_SLIDING_WINDOW_BLOCK_MASK_CACHE = {}
+
+def _get_sliding_window_block_mask(seq_q, seq_k, w_left, w_right, device):
+    key = (seq_q, seq_k, int(w_left), int(w_right), str(device))
+    bm = _SLIDING_WINDOW_BLOCK_MASK_CACHE.get(key)
+    if bm is None:
+        wl, wr = int(w_left), int(w_right)
+        def _band_mod(b, h, q_idx, kv_idx):
+            delta = kv_idx - q_idx
+            return (delta >= -wl) & (delta <= wr)
+        bm = create_block_mask(_band_mod, B=None, H=None, Q_LEN=seq_q, KV_LEN=seq_k, device=device)
+        _SLIDING_WINDOW_BLOCK_MASK_CACHE[key] = bm
+    return bm
+
+def _sliding_window_additive_mask(seq_q, seq_k, w_left, w_right, device, dtype):
+    """Build a (seq_q, seq_k) additive mask for masked SDPA fallback.
+    0 inside the band [i - w_left, i + w_right], -inf outside.
+    """
+    ii = torch.arange(seq_q, device=device)
+    jj = torch.arange(seq_k, device=device)
+    delta = jj[None, :] - ii[:, None]
+    in_band = (delta >= -int(w_left)) & (delta <= int(w_right))
+    mask = torch.zeros((seq_q, seq_k), dtype=dtype, device=device)
+    return mask.masked_fill(~in_band, float('-inf'))
+
+
+# Chunked-halo SDPA fallback. Math-equivalent to masked SDPA with a band
+# mask, but processes queries in non-overlapping chunks with a (w_left,
+# w_right) halo of keys/values on each side — every query stays inside its
+# chunk's softmax. Avoids materializing the O(N^2) mask.
+#
+# At realistic SAME-L decoder shapes (N=69632, W=17, packed sequence is
+# latent_length * (stride+1)): ~34x faster than full masked SDPA, and
+# ~140x less peak mask memory (~1 MB per chunk vs 9.7 GB for one N x N mask).
+# Chunk size is a tunable; 1024 is a good default at typical pretransform
+# decoder shapes. Larger chunks waste more compute on out-of-band tiles;
+# smaller chunks suffer from launch overhead.
+_SLIDING_WINDOW_CHUNK_SIZE = 1024
+
+def _sliding_window_chunked_halo_sdpa(q, k, v, w_left, w_right, chunk_size=_SLIDING_WINDOW_CHUNK_SIZE):
+    B, H, N, D = q.shape
+    outs = []
+    for q_start in range(0, N, chunk_size):
+        q_end = min(q_start + chunk_size, N)
+        k_start = max(0, q_start - int(w_left))
+        k_end = min(N, q_end + int(w_right))
+        q_c = q[..., q_start:q_end, :]
+        k_c = k[..., k_start:k_end, :]
+        v_c = v[..., k_start:k_end, :]
+        q_idx = torch.arange(q_start, q_end, device=q.device)
+        k_idx = torch.arange(k_start, k_end, device=q.device)
+        delta = k_idx[None, :] - q_idx[:, None]
+        in_band = (delta >= -int(w_left)) & (delta <= int(w_right))
+        mask = torch.zeros(delta.shape, dtype=q.dtype, device=q.device).masked_fill(~in_band, float('-inf'))
+        outs.append(F.scaled_dot_product_attention(q_c, k_c, v_c, attn_mask=mask, is_causal=False))
+    return torch.cat(outs, dim=-2)
+
 
 def checkpoint(function, *args, **kwargs):
     kwargs.setdefault("use_reentrant", False)
+    # Preserve autocast context during recomputation to avoid dtype mismatches
+    if "context_fn" not in kwargs:
+        from torch.amp import autocast
+        import functools
+        # Get current autocast state
+        if torch.is_autocast_enabled():
+            dtype = torch.get_autocast_dtype('cuda')
+            def get_contexts():
+                return (
+                    autocast('cuda', dtype=dtype),
+                    autocast('cuda', dtype=dtype),
+                )
+            kwargs["context_fn"] = get_contexts
     return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 
 
@@ -137,7 +273,7 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device = device)
         return self.forward(t)
 
-    @autocast(device_type=autocast_device_type, enabled=False)
+    @autocast("cuda", enabled = False)
     def forward(self, t):
         device = self.inv_freq.device
 
@@ -162,9 +298,8 @@ def rotate_half(x):
     x1, x2 = x.unbind(dim = -2)
     return torch.cat((-x2, x1), dim = -1)
 
-
-@autocast(device_type=autocast_device_type, enabled=False)
-def apply_rotary_pos_emb(t, freqs, scale=1):
+@autocast("cuda", enabled = False)
+def apply_rotary_pos_emb(t, freqs, scale = 1):
     out_dtype = t.dtype
 
     # cast to float32 if necessary for numerical stability
@@ -187,7 +322,7 @@ def apply_rotary_pos_emb(t, freqs, scale=1):
 
 # norms
 class DynamicTanh(nn.Module):
-    def __init__(self, dim, init_alpha=10.0):
+    def __init__(self, dim, init_alpha=4.0, **kwargs):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1) * init_alpha)
         self.gamma = nn.Parameter(torch.ones(dim))
@@ -252,6 +387,26 @@ class LayerNorm(nn.Module):
             output = F.layer_norm(x.float(), x.shape[-1:], weight=self.gamma.float(), bias=self.beta.float(), eps=self.eps)
             return output.to(x.dtype)
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, fix_scale=False, force_fp32=False, eps=1e-5):
+        super().__init__()
+
+        if fix_scale:
+            self.register_buffer("gamma", torch.ones(dim))
+        else:
+            self.gamma = nn.Parameter(torch.ones(dim))
+
+        self.eps = eps
+
+        self.force_fp32 = force_fp32
+
+    def forward(self, x):
+        if not self.force_fp32:
+            return F.rms_norm(x, x.shape[-1:], weight=self.gamma, eps=self.eps)
+        else:
+            output = F.rms_norm(x.float(), x.shape[-1:], weight=self.gamma.float(), eps=self.eps)
+            return output.to(x.dtype)
+
 class LayerScale(nn.Module):
     def __init__(self, dim, init_val = 1e-5):
         super().__init__()
@@ -286,6 +441,13 @@ class GLU(nn.Module):
         x, gate = x.chunk(2, dim = -1)
         return x * self.act(gate)
 
+class Sin(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.sin(3.14159265359 * x)
+
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -297,13 +459,14 @@ class FeedForward(nn.Module):
         use_conv = False,
         conv_kernel_size = 3,
         zero_init_output = True,
+        sinusoidal = False
     ):
         super().__init__()
         inner_dim = int(dim * mult)
 
         # Default to SwiGLU
 
-        activation = nn.SiLU()
+        activation = nn.SiLU() if not sinusoidal else Sin()
 
         dim_out = dim if dim_out is None else dim_out
 
@@ -334,8 +497,26 @@ class FeedForward(nn.Module):
         )
 
     #@compile
-    def forward(self, x):
-        return self.ff(x)
+    def forward(self, x, varlen_metadata=None):
+        if varlen_metadata is not None and index_first_axis is not None and pad_input is not None:
+            # Pack valid tokens for efficient FFN computation (skip padding tokens)
+            # Padding positions become zeros after unpack, which is fine since FFN output
+            # is added to residual, preserving values at padding positions
+            batch_size = varlen_metadata["batch_size"]
+            seq_len = varlen_metadata["seq_len"]
+            indices = varlen_metadata["indices"]
+            dim = x.shape[-1]
+
+            # Pack to (N_valid, D)
+            x_packed = index_first_axis(x.reshape(-1, dim), indices)
+
+            # FFN on packed representation with pseudo-batch dim
+            x_packed = self.ff(x_packed.unsqueeze(0)).squeeze(0)
+
+            # Unpack back to (B, T, D)
+            return pad_input(x_packed, indices, batch_size, seq_len)
+        else:
+            return self.ff(x)
 
 class Attention(nn.Module):
     def __init__(
@@ -345,7 +526,8 @@ class Attention(nn.Module):
         dim_context = None,
         causal = False,
         zero_init_output=True,
-        qk_norm: Literal['l2', 'ln', 'dyt', 'none'] = 'none',
+        qk_norm_eps = 1e-6,
+        qk_norm: Literal['l2', 'ln', 'rms', 'dyt', 'none'] = 'none',
         differential = False,
         feat_scale = False
     ):
@@ -378,105 +560,141 @@ class Attention(nn.Module):
         if zero_init_output:
             nn.init.zeros_(self.to_out.weight)
 
-        if qk_norm not in ['l2', 'ln', 'dyt','none']:
-            raise ValueError(f'qk_norm must be one of ["l2", "ln", "none"], got {qk_norm}')
+        if qk_norm not in ['l2', 'ln', 'rms', 'dyt','none']:
+            raise ValueError(f'qk_norm must be one of ["l2", "ln", "rms" ,"dyt", "none"], got {qk_norm}')
             
         self.qk_norm = qk_norm
+        self.qk_norm_eps = qk_norm_eps
 
         if self.qk_norm == "ln":
-            self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
-            self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=1.0e-6)
+            self.q_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=qk_norm_eps)
+            self.k_norm = nn.LayerNorm(dim_heads, elementwise_affine=True, eps=qk_norm_eps)
+        elif self.qk_norm == "rms":
+            self.q_norm = RMSNorm(dim_heads, eps=qk_norm_eps)
+            self.k_norm = RMSNorm(dim_heads, eps=qk_norm_eps)
+        elif self.qk_norm == 'dyt':
+            self.q_norm = DynamicTanh(dim_heads)
+            self.k_norm = DynamicTanh(dim_heads)
 
-        # Using 1d neighborhood attention
-        self.natten_kernel_size = natten_kernel_size
-        if natten_kernel_size is not None:
-            return
+        self.feat_scale = feat_scale
 
-        self.use_pt_flash = device.type == "cuda" and version.parse(
-            torch.__version__
-        ) >= version.parse("2.0.0")
+        if self.feat_scale:
+            self.lambda_dc = nn.Parameter(torch.zeros(dim))
+            self.lambda_hf = nn.Parameter(torch.zeros(dim))
 
-        self.use_fa_flash = device.type == "cuda" and flash_attn_func is not None
-
-        self.sdp_backends = [
-            torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-            torch.nn.attention.SDPBackend.MATH,
-            torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-        ]
-
-    def flash_attn(
-            self,
-            q, 
-            k, 
-            v,
-            mask = None,
-            causal = None
-    ):
-        batch, heads, q_len, _, k_len, device = *q.shape, k.shape[-2], q.device
-        kv_heads = k.shape[1]
-        # Recommended for multi-query single-key-value attention by Tri Dao
-        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
-
-        if heads != kv_heads:
-            # Repeat interleave kv_heads to match q_heads
-            heads_per_kv_head = heads // kv_heads
-            k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
-
-        if k.ndim == 3:
-            k = rearrange(k, 'b ... -> b 1 ...').expand_as(q)
-
-        if v.ndim == 3:
-            v = rearrange(v, 'b ... -> b 1 ...').expand_as(q)
-
-        causal = self.causal if causal is None else causal
-
-        if q_len == 1 and causal:
-            causal = False
+        self.causal = causal
         
-        if mask is not None:
-            assert mask.ndim == 4
-            mask = mask.expand(batch, heads, q_len, k_len)
+    @compile
+    def apply_qk_layernorm(self, q, k):
+        q_type = q.dtype
+        k_type = k.dtype
+        q = self.q_norm(q).to(q_type)
+        k = self.k_norm(k).to(k_type)
+        return q, k
 
-        # handle kv cache - this should be bypassable in updated flash attention 2
 
-        if k_len > q_len and causal:
-            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
-            if mask is None:
-                mask = ~causal_mask
-            else:
-                mask = mask & ~causal_mask
-            causal = False
+    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None):
 
-        # manually handle causal mask, if another mask was given
+        if self.num_heads != self.kv_heads:
+             # Repeat interleave kv_heads to match q_heads for grouped query attention
+             heads_per_kv_head = self.num_heads // self.kv_heads
+             k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
 
-        row_is_entirely_masked = None
+        flash_attn_available = flash_attn_func is not None
+        flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None
 
-        if mask is not None and causal:
-            causal_mask = self.create_causal_mask(q_len, k_len, device = device)
-            mask = mask & ~causal_mask
+        if causal and (flex_attention_block_mask is not None or flex_attention_score_mod is not None):
+            flex_attention_block_mask = None
+            flex_attention_score_mod = None
 
-            # protect against an entire row being masked out
+        if flex_attention_block_mask is not None or flex_attention_score_mod is not None:
+            # Flex attention path - use V-zeroing for padding mask
+            if padding_mask is not None:
+                mask_expanded = padding_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
+                v = v * mask_expanded
+            out = flex_attention_compiled(q,k,v,
+                block_mask = flex_attention_block_mask,
+                score_mod = flex_attention_score_mod)
+        elif flash_attn_available and varlen_metadata is not None and flash_attn_varlen_available:
+            # Flash attention with varlen using precomputed metadata (fast path)
+            batch_size = varlen_metadata["batch_size"]
+            seq_len = varlen_metadata["seq_len"]
+            cu_seqlens = varlen_metadata["cu_seqlens"]
+            max_seqlen = varlen_metadata["max_seqlen"]
+            indices = varlen_metadata["indices"]
 
-            row_is_entirely_masked = ~mask.any(dim = -1)
-            mask[..., 0] = mask[..., 0] | row_is_entirely_masked
+            fa_dtype_in = q.dtype
+            # Rearrange to (B, T, H, D) for flash_attn
+            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
 
-            causal = False
+            if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
+                q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
 
-        if device.type == "cuda":
-            with torch.nn.attention.sdpa_kernel(self.sdp_backends):
-                out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=mask, is_causal=causal
-                )
-        else:
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=causal
+            # Pack q, k, v using precomputed indices (much faster than calling unpad_input 3x)
+            num_heads, head_dim = q.shape[2], q.shape[3]
+            q_unpad = index_first_axis(q.reshape(-1, num_heads, head_dim), indices)
+            k_unpad = index_first_axis(k.reshape(-1, num_heads, head_dim), indices)
+            v_unpad = index_first_axis(v.reshape(-1, num_heads, head_dim), indices)
+
+            out_unpad = flash_attn_varlen_func(
+                q_unpad, k_unpad, v_unpad,
+                cu_seqlens, cu_seqlens,
+                max_seqlen, max_seqlen,
+                causal=causal if causal is not None else False,
+                window_size=flash_attn_sliding_window if flash_attn_sliding_window is not None else (-1, -1),
             )
 
-        # for a row that is entirely masked out, should zero out the output of that row token
+            # Pad output back to original shape
+            out = pad_input(out_unpad, indices, batch_size, seq_len)
+            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+        elif flash_attn_available:
+            # Standard flash attention (no padding mask, or varlen imports not available)
+            # Apply V-zeroing fallback if padding_mask provided but we couldn't use varlen
+            if padding_mask is not None:
+                mask_expanded = padding_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
+                v = v * mask_expanded
+            fa_dtype_in = q.dtype
+            q, k, v = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k, v))
 
-        if row_is_entirely_masked is not None:
-            out = out.masked_fill(row_is_entirely_masked[..., None], 0.)
+            if fa_dtype_in != torch.float16 and fa_dtype_in != torch.bfloat16:
+                q, k, v = map(lambda t: t.to(torch.float16), (q, k, v))
 
+            out = flash_attn_func(q, k, v, causal = causal, window_size=flash_attn_sliding_window if (flash_attn_sliding_window is not None) else [-1,-1])
+
+            out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
+        else:
+            # No flash-attn available. Sliding-window fallback cascade:
+            #   Tier 2: flex_attention with band block_mask (best when torch.compile works)
+            #   Tier 3: chunked-halo masked SDPA           (math-equivalent, ~30x faster than tier 4)
+            #   Tier 4: full masked SDPA (N x N mask)      (last resort; high memory)
+            # For the no-sliding-window case, fall through to plain SDPA full attention.
+            # All apply V-zeroing for padding masks (cheap and equivalent to masking
+            # those positions out of attention output).
+            if padding_mask is not None:
+                mask_expanded = padding_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
+                v = v * mask_expanded
+            if flash_attn_sliding_window is not None:
+                seq_q, seq_k = q.shape[2], k.shape[2]
+                wl, wr = flash_attn_sliding_window
+                handled = False
+                if flex_attention_available and flex_attention_compiled is not None:
+                    try:
+                        bm = _get_sliding_window_block_mask(seq_q, seq_k, wl, wr, q.device)
+                        out = flex_attention_compiled(q, k, v, block_mask=bm)
+                        handled = True
+                    except Exception as _flex_err:
+                        logging.debug(f"flex_attention failed, trying chunked-halo SDPA: {_flex_err}")
+                if not handled:
+                    try:
+                        out = _sliding_window_chunked_halo_sdpa(q, k, v, wl, wr)
+                        handled = True
+                    except Exception as _chunk_err:
+                        logging.debug(f"chunked-halo SDPA failed, falling back to full masked SDPA: {_chunk_err}")
+                if not handled:
+                    add_mask = _sliding_window_additive_mask(seq_q, seq_k, wl, wr, q.device, q.dtype)
+                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=add_mask, is_causal=False)
+            else:
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=causal if causal is not None else False)
         return out
 
 
@@ -486,10 +704,13 @@ class Attention(nn.Module):
         x,
         context = None,
         rotary_pos_emb = None,
-        causal = None, 
+        rotary_pos_emb_k = None,
+        causal = None,
         flex_attention_block_mask = None,
         flex_attention_score_mod = None,
-        flash_attn_sliding_window = None
+        flash_attn_sliding_window = None,
+        padding_mask = None,
+        varlen_metadata = None,
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
@@ -522,8 +743,8 @@ class Attention(nn.Module):
 
         # Normalize q and k for cosine sim attention
         if self.qk_norm == "l2":
-            q = F.normalize(q, dim=-1)
-            k = F.normalize(k, dim=-1)
+            q = F.normalize(q, dim=-1, eps=self.qk_norm_eps)
+            k = F.normalize(k, dim=-1, eps=self.qk_norm_eps)
         elif self.qk_norm != "none":
             q, k = self.apply_qk_layernorm(q, k)
 
@@ -534,12 +755,22 @@ class Attention(nn.Module):
             q = q.to(torch.float32)
             k = k.to(torch.float32)
             freqs = freqs.to(torch.float32)
-            if q.shape[-2] >= k.shape[-2]:
-                ratio = q.shape[-2] / k.shape[-2]
-                q_freqs, k_freqs = freqs, ratio * freqs
+        
+            q_freqs = freqs
+
+            if rotary_pos_emb_k is not None:
+                k_freqs, _ = rotary_pos_emb_k
+                k_freqs = k_freqs.to(torch.float32)
             else:
-                ratio = k.shape[-2] / q.shape[-2]
-                q_freqs, k_freqs = ratio * freqs, freqs
+                k_freqs = q_freqs
+
+                if q.shape[-2] >= k.shape[-2]:
+                    ratio = q.shape[-2] / k.shape[-2]
+                    q_freqs, k_freqs = freqs, ratio * freqs
+                else:
+                    ratio = k.shape[-2] / q.shape[-2]
+                    q_freqs, k_freqs = ratio * freqs, freqs
+
             q = apply_rotary_pos_emb(q, q_freqs)
             k = apply_rotary_pos_emb(k, k_freqs)
             q = q.to(v.dtype)
@@ -555,12 +786,11 @@ class Attention(nn.Module):
         if self.differential:
             q, q_diff = q.unbind(dim = 1)
             k, k_diff = k.unbind(dim = 1)
-            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
-            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
+            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
             out = out - out_diff
         else:
-            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window)
-
+            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
         # merge heads
         out = rearrange(out, ' b h n d -> b n (h d)')
 
@@ -573,11 +803,15 @@ class Attention(nn.Module):
         out = self.to_out(out)
 
         if self.feat_scale:
-            out_dc = out.mean(dim=-2, keepdim=True)
-            out_hf = out - out_dc
-
-            # Selectively modulate DC and high frequency components
-            out = out + self.lambda_dc * out_dc + self.lambda_hf * out_hf
+            if padding_mask is not None:
+                mask = padding_mask.unsqueeze(-1).to(out.dtype)  # (b, n, 1)
+                out_dc = (out * mask).sum(dim=-2, keepdim=True) / mask.sum(dim=-2, keepdim=True).clamp(min=1)
+                out_hf = out - out_dc
+                out = out + (self.lambda_dc * out_dc + self.lambda_hf * out_hf) * mask
+            else:
+                out_dc = out.mean(dim=-2, keepdim=True)
+                out_hf = out - out_dc
+                out = out + self.lambda_dc * out_dc + self.lambda_hf * out_hf
 
         return out
 
@@ -626,13 +860,15 @@ class TransformerBlock(nn.Module):
             cross_attend = False,
             dim_context = None,
             global_cond_dim = None,
+            local_add_cond_dim = None,
+            modular_local_cond_configs = None,
             causal = False,
             zero_init_branch_outputs = True,
             conformer = False,
             layer_ix = -1,
-            remove_norms = False,
             add_rope = False,
             layer_scale = False,
+            norm_type = 'layer_norm',
             attn_kwargs = {},
             ff_kwargs = {},
             norm_kwargs = {}
@@ -648,9 +884,18 @@ class TransformerBlock(nn.Module):
         if layer_scale and zero_init_branch_outputs:
             print('zero_init_branch_outputs is redundant with layer_scale, setting zero_init_branch_outputs to False')
             zero_init_branch_outputs = False
-            
-        self.pre_norm = LayerNorm(dim,**norm_kwargs) if not remove_norms else DynamicTanh(dim)
+        
+        if norm_type not in ['layer_norm', 'rms_norm', 'dyt']:
+            raise ValueError(f'norm_type must be one of ["layer_norm", "rms_norm", "dyt"], got {norm_type}')
 
+        norm_layer_map = {
+            'layer_norm': LayerNorm,
+            'rms_norm': RMSNorm,
+            'dyt': DynamicTanh
+        }
+        norm_layer = norm_layer_map[norm_type]
+
+        self.pre_norm = norm_layer(dim,**norm_kwargs)
         self.add_rope = add_rope
 
         self.self_attn = Attention(
@@ -665,7 +910,7 @@ class TransformerBlock(nn.Module):
 
         self.cross_attend = cross_attend
         if cross_attend:
-            self.cross_attend_norm = LayerNorm(dim, **norm_kwargs) if not remove_norms else DynamicTanh(dim)
+            self.cross_attend_norm = norm_layer(dim, **norm_kwargs)
             self.cross_attn = Attention(
                 dim,
                 dim_heads = self.dim_heads,
@@ -676,7 +921,7 @@ class TransformerBlock(nn.Module):
             )
             self.cross_attn_scale = LayerScale(dim) if layer_scale else nn.Identity()
         
-        self.ff_norm = LayerNorm(dim, **norm_kwargs) if not remove_norms else DynamicTanh(dim)
+        self.ff_norm = norm_layer(dim, **norm_kwargs)
         self.ff = FeedForward(dim, zero_init_output=zero_init_branch_outputs, **ff_kwargs)
         self.ff_scale = LayerScale(dim) if layer_scale else nn.Identity()
 
@@ -692,21 +937,76 @@ class TransformerBlock(nn.Module):
         if global_cond_dim is not None:
             self.to_scale_shift_gate = nn.Parameter(torch.randn(6*dim)/dim**0.5)
 
+        self.local_add_cond_dim = local_add_cond_dim
+
+        if local_add_cond_dim is not None:
+            self.to_local_embed = nn.Sequential(
+                nn.Linear(local_add_cond_dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            )
+
+            nn.init.zeros_(self.to_local_embed[-1].weight)
+            nn.init.zeros_(self.to_local_embed[-1].bias)
+
+        else:
+            self.to_local_embed = None
+
+        # Modular local conditioning - independent projections per conditioning ID
+        self.modular_local_cond_configs = modular_local_cond_configs or []
+        self.modular_local_embeds = nn.ModuleDict()
+
+        for config in self.modular_local_cond_configs:
+            cond_id = config["id"]
+            cond_dim = config["dim"]
+            proj = nn.Sequential(
+                nn.Linear(cond_dim, dim),
+                nn.SiLU(),
+                nn.Linear(dim, dim)
+            )
+            # Zero-init output layer so new conditioning doesn't affect model initially
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
+            self.modular_local_embeds[cond_id] = proj
+
         self.rope = RotaryEmbedding(self.dim_heads // 2) if add_rope else None
-        
+
+    def _apply_local_conditioning(self, x, local_add_cond, modular_local_cond):
+        """Apply local additive and modular local conditioning to x."""
+        if local_add_cond is not None and self.to_local_embed is not None:
+            local_emb = self.to_local_embed(local_add_cond)
+            x = x + _left_pad_to_match(local_emb, x.shape[-2])
+
+        if modular_local_cond is not None and len(self.modular_local_embeds) > 0:
+            modular_sum = None
+            for cond_id, proj in self.modular_local_embeds.items():
+                if cond_id in modular_local_cond:
+                    local_emb = proj(modular_local_cond[cond_id])
+                    local_emb = _left_pad_to_match(local_emb, x.shape[-2])
+                    modular_sum = local_emb if modular_sum is None else modular_sum + local_emb
+            if modular_sum is not None:
+                x = x + modular_sum
+
+        return x
+
     @compile
     def forward(
         self,
         x,
         context = None,
         global_cond=None,
+        local_add_cond=None,
+        modular_local_cond=None,
         rotary_pos_emb = None,
+        cross_attn_rotary_pos_emb = None,
         self_attention_block_mask = None,
         self_attention_score_mod = None,
         cross_attention_block_mask = None,
         cross_attention_score_mod = None,
         self_attention_flash_sliding_window = None,
-        cross_attention_flash_sliding_window = None
+        cross_attention_flash_sliding_window = None,
+        padding_mask = None,
+        varlen_metadata = None,
     ):
         if rotary_pos_emb is None and self.add_rope:
             rotary_pos_emb = self.rope.forward_from_seq_len(x.shape[-2])
@@ -719,36 +1019,48 @@ class TransformerBlock(nn.Module):
             residual = x
             x = self.pre_norm(x)
             x = x * (1 + scale_self) + shift_self
-            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window)
+            x = self.self_attn(x, rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
             x = x * torch.sigmoid(1 - gate_self)
             x = self.self_attn_scale(x)
             x = x + residual
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
-            
+                if cross_attn_rotary_pos_emb is not None:
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                else:
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
+
+            x = self._apply_local_conditioning(x, local_add_cond, modular_local_cond)
 
             # feedforward with adaLN
             residual = x
             x = self.ff_norm(x)
             x = x * (1 + scale_ff) + shift_ff
-            x = self.ff(x)
+            x = self.ff(x, varlen_metadata=varlen_metadata)
             x = x * torch.sigmoid(1 - gate_ff)
             x = self.ff_scale(x)
             x = x + residual
 
         else:
-            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window))
+            x = x + self.self_attn_scale(self.self_attn(self.pre_norm(x), rotary_pos_emb = rotary_pos_emb, flex_attention_block_mask = self_attention_block_mask, flex_attention_score_mod = self_attention_score_mod, flash_attn_sliding_window = self_attention_flash_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata))
 
             if context is not None and self.cross_attend:
-                x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                if cross_attn_rotary_pos_emb is not None:
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                else:
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
                     
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
 
-            x = x + self.ff_scale(self.ff(self.ff_norm(x)))
+            x = self._apply_local_conditioning(x, local_add_cond, modular_local_cond)
+
+            x = x + self.ff_scale(self.ff(self.ff_norm(x), varlen_metadata=varlen_metadata))
+            
+
         return x
         
 class ContinuousTransformer(nn.Module):
@@ -764,8 +1076,11 @@ class ContinuousTransformer(nn.Module):
         cond_token_dim=None,
         final_cross_attn_ix=-1,
         global_cond_dim=None,
+        local_add_cond_dim=None,
+        modular_local_cond_configs=None,
         causal=False,
         rotary_pos_emb=True,
+        cross_attn_rotary_pos_emb=False,
         zero_init_branch_outputs=True,
         conformer=False,
         use_sinusoidal_emb=False,
@@ -790,6 +1105,11 @@ class ContinuousTransformer(nn.Module):
             self.rotary_pos_emb = RotaryEmbedding(max(dim_heads // 2, 32))
         else:
             self.rotary_pos_emb = None
+
+        if cross_attn_rotary_pos_emb:
+            self.cross_attn_rotary_pos_emb = RotaryEmbedding(max(dim_heads // 2, 32))
+        else:
+            self.cross_attn_rotary_pos_emb = None
 
         self.num_memory_tokens = num_memory_tokens
         if num_memory_tokens > 0:
@@ -824,6 +1144,8 @@ class ContinuousTransformer(nn.Module):
                     cross_attend = should_cross_attend,
                     dim_context = cond_token_dim,
                     global_cond_dim = global_cond_dim,
+                    local_add_cond_dim = local_add_cond_dim,
+                    modular_local_cond_configs = modular_local_cond_configs,
                     causal = causal,
                     zero_init_branch_outputs = zero_init_branch_outputs,
                     conformer=conformer,
@@ -835,11 +1157,15 @@ class ContinuousTransformer(nn.Module):
     def forward(
         self,
         x,
+        context = None,
         prepend_embeds = None,
         global_cond = None,
+        local_add_cond = None,
+        modular_local_cond = None,
         return_info = False,
         use_checkpointing = True,
         exit_layer_ix = None,
+        padding_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
@@ -869,19 +1195,57 @@ class ContinuousTransformer(nn.Module):
         else:
             rotary_pos_emb = None
 
+        if self.cross_attn_rotary_pos_emb is not None:
+            cross_attn_rotary_pos_emb = self.cross_attn_rotary_pos_emb.forward_from_seq_len(context.shape[-1])
+        else:
+            cross_attn_rotary_pos_emb = None
+
         if self.use_sinusoidal_emb or self.use_abs_pos_emb:
             x = x + self.pos_emb(x)
 
         if global_cond is not None and self.global_cond_embedder is not None:
             global_cond = self.global_cond_embedder(global_cond)
 
+        # Extend padding mask for prepended tokens if provided
+        extended_padding_mask = None
+        varlen_metadata = None
+        if padding_mask is not None:
+            # Compute total prepend length (memory tokens + prepend_embeds)
+            prepend_length = self.num_memory_tokens
+            if prepend_embeds is not None:
+                prepend_length += prepend_embeds.shape[1]
+
+            # Prepend tokens are always valid for attention
+            if prepend_length > 0:
+                prepend_valid = torch.ones(batch, prepend_length, device=device, dtype=torch.bool)
+                extended_padding_mask = torch.cat([prepend_valid, padding_mask], dim=-1)
+            else:
+                extended_padding_mask = padding_mask
+
+            # Precompute varlen metadata once for all layers (major performance optimization)
+            # Only compute if varlen attention is actually available
+            if flash_attn_varlen_func is not None and index_first_axis is not None:
+                varlen_metadata = precompute_varlen_metadata(extended_padding_mask)
+
         # Iterate over the transformer layers
         for layer_ix, layer in enumerate(self.layers):
 
+            layer_kwargs = {
+                "context": context,
+                "rotary_pos_emb": rotary_pos_emb,
+                "cross_attn_rotary_pos_emb": cross_attn_rotary_pos_emb,
+                "global_cond": global_cond,
+                "local_add_cond": local_add_cond,
+                "modular_local_cond": modular_local_cond,
+                "self_attention_flash_sliding_window": self.sliding_window,
+                "padding_mask": extended_padding_mask,
+                "varlen_metadata": varlen_metadata
+            }
+
             if use_checkpointing:
-                x = checkpoint(layer, x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, **kwargs)
+                x = checkpoint(layer, x, **layer_kwargs, **kwargs)
             else:
-                x = layer(x, rotary_pos_emb = rotary_pos_emb, global_cond=global_cond, self_attention_flash_sliding_window = self.sliding_window, **kwargs)
+                x = layer(x, **layer_kwargs, **kwargs)
 
             if return_info:
                 info["hidden_states"].append(x)
